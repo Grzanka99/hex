@@ -133,13 +133,11 @@ mod transcription_preparation;
 mod transcription_service;
 
 #[cfg(target_os = "macos")]
-use std::fs::{self, OpenOptions};
+use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::Ordering;
@@ -149,8 +147,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 #[cfg(target_os = "macos")]
 use color_eyre::eyre::eyre;
-#[cfg(target_os = "macos")]
-use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 #[cfg(target_os = "macos")]
 #[derive(Parser)]
@@ -411,19 +407,7 @@ enum MeetingCommand {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let log_dir = app_paths::logs_dir()?;
-    fs::create_dir_all(&log_dir)?;
-    let process_log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("process.log"))?;
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("voice_control=info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr.and(Mutex::new(process_log)))
-        .init();
-    ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::Relaxed))?;
+    let log_dir = app_paths::init_process_logging(&SHUTDOWN)?;
 
     let event_path = log_dir.join("live.ndjson");
     let cli = Cli::parse();
