@@ -234,6 +234,7 @@ logs are separate and currently unbounded on disk. See the
 Settings                                 // settings
 ├── Dictation shortcut -> Capture a replacement binding
 ├── Microphone -> Automatic or saved device
+│   └── Open menu covers the controls beneath it; click elsewhere dismisses
 ├── Microphone mode
 │   ├── Keep ready (fast) -> Open while idle; pre-roll available
 │   └── Release when idle -> Open on press; no pre-roll; startup delay
@@ -261,6 +262,18 @@ not a managed-device policy or native power assertion. The pause-script regressi
 checks that inactive players are absent before AppleScript application resolution;
 it does not exercise Music, Spotify, or VLC through Automation. An opt-in native
 assertion smoke exercises IOKit without starting microphone capture.
+
+**Fixed after 2.1.20:** through 2.1.20 the microphone menu was painted without
+occluding the panel, so hovering or clicking a device also reached the setting
+under the pointer ([#94](https://github.com/anomalyco/hex/issues/94)), and it
+only closed by choosing or reopening. The menu is now anchored to its button,
+occludes the controls beneath it, and closes on any outside mouse-down.
+`microphone_picker_occludes_the_controls_beneath_it` in
+[app_window.rs](../../src/app_window.rs) renders the production menu over a
+hoverable, clickable control and fails without the occlusion; it does not prove
+a native pointer session. The recognition-hints editor also now uses the compact
+multiline height, so it no longer overlaps the shortcut row for Whisper models.
+Screen Recording was unavailable, so that layout is unverified visually.
 
 **Easy to misread:** an open microphone is not an active recording. Sleeping
 Commands still needs open input; it is not Release when idle.

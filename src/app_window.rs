@@ -106,6 +106,74 @@ fn sidebar_update_button(
     })
 }
 
+/// The microphone menu is deferred above the settings panel and occludes
+/// everything beneath it, so hovering or choosing a device never reaches the
+/// controls under the menu. A mouse-down anywhere else dismisses it.
+fn microphone_picker_menu(
+    choices: Vec<Option<String>>,
+    selected: Option<String>,
+    error: Option<String>,
+    choose: impl Fn(&Option<String>, &mut Window, &mut App) + 'static,
+    dismiss: impl Fn(&(), &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
+    let choose = Rc::new(choose);
+    div()
+        .id("microphone-picker")
+        .debug_selector(|| "microphone-picker".into())
+        .absolute()
+        .top(px(CONTROL_HEIGHT + 4.0))
+        .right_0()
+        .w(px(220.0))
+        .max_h(px(240.0))
+        .p_2()
+        .overflow_y_scroll()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(LINE))
+        .bg(rgb(SURFACE))
+        .shadow_lg()
+        .occlude()
+        .on_mouse_down_out(move |_, window, cx| dismiss(&(), window, cx))
+        .children(choices.into_iter().enumerate().map(|(index, device)| {
+            let is_selected = selected == device;
+            let label = device.clone().unwrap_or_else(|| "Automatic".into());
+            let choose = choose.clone();
+            div()
+                .id(("microphone-choice", index))
+                .debug_selector(move || format!("microphone-choice-{index}"))
+                .w_full()
+                .h(px(34.0))
+                .px_3()
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded_sm()
+                .text_size(px(12.0))
+                .text_color(if is_selected {
+                    rgb(TEXT)
+                } else {
+                    rgb(TEXT_SOFT)
+                })
+                .when(is_selected, |row| row.bg(rgb(SURFACE_SELECTED)))
+                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+                .child(label)
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    choose(&device, window, cx);
+                })
+        }))
+        .when_some(error, |picker, error| {
+            picker.child(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_size(px(11.0))
+                    .text_color(rgb(NEGATIVE))
+                    .child(error),
+            )
+        })
+}
+
 fn settings_pane(content: Div) -> AnyElement {
     div()
         .size_full()
@@ -3123,55 +3191,23 @@ impl AppWindow {
         let choices = std::iter::once(None)
             .chain(self.microphone_devices.iter().cloned().map(Some))
             .collect::<Vec<_>>();
-        div()
-            .id("microphone-picker")
-            .absolute()
-            .top(px(170.0))
-            .right(px(16.0))
-            .w(px(220.0))
-            .max_h(px(240.0))
-            .p_2()
-            .overflow_y_scroll()
-            .rounded_sm()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(SURFACE))
-            .shadow_lg()
-            .children(choices.into_iter().enumerate().map(|(index, device)| {
-                let selected = self.settings.microphone == device;
-                let label = device.clone().unwrap_or_else(|| "Automatic".into());
-                div()
-                    .id(("microphone-choice", index))
-                    .w_full()
-                    .h(px(34.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .rounded_sm()
-                    .text_size(px(12.0))
-                    .text_color(if selected { rgb(TEXT) } else { rgb(TEXT_SOFT) })
-                    .when(selected, |row| row.bg(rgb(SURFACE_SELECTED)))
-                    .hover(|row| row.bg(rgb(SURFACE_HOVER)))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings.microphone = device.clone();
-                        this.microphone_picker_open = false;
-                        this.microphone_picker_error = None;
-                        this.save_settings(cx);
-                    }))
-            }))
-            .when_some(self.microphone_picker_error.clone(), |picker, error| {
-                picker.child(
-                    div()
-                        .px_3()
-                        .pt_2()
-                        .text_size(px(11.0))
-                        .text_color(rgb(NEGATIVE))
-                        .child(error),
-                )
-            })
-            .into_any_element()
+        microphone_picker_menu(
+            choices,
+            self.settings.microphone.clone(),
+            self.microphone_picker_error.clone(),
+            cx.listener(|this, device: &Option<String>, _, cx| {
+                this.settings.microphone = device.clone();
+                this.microphone_picker_open = false;
+                this.microphone_picker_error = None;
+                this.save_settings(cx);
+            }),
+            cx.listener(|this, _: &(), _, cx| {
+                this.microphone_picker_open = false;
+                this.microphone_picker_error = None;
+                cx.notify();
+            }),
+        )
+        .into_any_element()
     }
 
     fn set_launch_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -3583,25 +3619,17 @@ impl AppWindow {
                                     .child(settings_row(
                                         "Microphone",
                                         "Automatically chooses the preferred available input",
-                                        disclosure_button(microphone_label)
-                                            .id("microphone-setting")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.microphone_picker_open =
-                                                    !this.microphone_picker_open;
-                                                if this.microphone_picker_open {
-                                                    match crate::audio::input_device_names() {
-                                                        Ok(devices) => {
-                                                            this.microphone_devices = devices;
-                                                            this.microphone_picker_error = None;
-                                                        }
-                                                        Err(error) => {
-                                                            this.microphone_picker_error =
-                                                                Some(error.to_string());
-                                                        }
-                                                    }
-                                                }
-                                                cx.notify();
-                                            })),
+                                        div()
+                                            .relative()
+                                            .flex_none()
+                                            .child(
+                                                disclosure_button(microphone_label)
+                                                    .id("microphone-setting")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.toggle_microphone_picker(cx)
+                                                    })),
+                                            )
+                                            .children(microphone_picker.map(deferred)),
                                     ))
                                     .when(
                                         transcription_model.supports_recognition_hints,
@@ -3611,7 +3639,7 @@ impl AppWindow {
                                                 "Names and terms to softly prime the speech model",
                                                 div()
                                                     .w(px(320.0))
-                                                    .h(px(76.0))
+                                                    .flex_none()
                                                     .child(
                                                         self.transcription_hints.entity.clone(),
                                                     ),
@@ -3797,9 +3825,22 @@ impl AppWindow {
                                         .border_b_0()
                                         .id("sound-effects-setting"),
                                     ),
-                            )
-                             .children(microphone_picker),
+                            ),
         )
+    }
+
+    fn toggle_microphone_picker(&mut self, cx: &mut Context<Self>) {
+        self.microphone_picker_open = !self.microphone_picker_open;
+        if self.microphone_picker_open {
+            match crate::audio::input_device_names() {
+                Ok(devices) => {
+                    self.microphone_devices = devices;
+                    self.microphone_picker_error = None;
+                }
+                Err(error) => self.microphone_picker_error = Some(error.to_string()),
+            }
+        }
+        cx.notify();
     }
 
     fn render_setup(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -4177,10 +4218,11 @@ impl AppWindow {
 
     fn transcription_hints_input(initial: &str, cx: &mut Context<Self>) -> ProcessingInput {
         let entity = cx.new(|cx| {
-            TextInput::multiline(
+            TextInput::multiline_with_height(
                 cx,
                 "Names and terms Whisper should expect, e.g. OpenCode, Effect...",
                 initial,
+                px(COMPACT_MULTILINE_INPUT_HEIGHT),
             )
         });
         let subscription = cx.subscribe(&entity, |this, _, _: &TextChanged, cx| {
@@ -8891,6 +8933,112 @@ mod tests {
             cx.simulate_click(button.center(), GpuiModifiers::default());
             assert_eq!(calls.get(), usize::from(!preview), "preview={preview}");
         }
+    }
+
+    #[gpui::test]
+    fn microphone_picker_occludes_the_controls_beneath_it(cx: &mut gpui::TestAppContext) {
+        #[derive(Default)]
+        struct Observed {
+            beneath_clicks: usize,
+            beneath_hovered: bool,
+            chosen: Option<Option<String>>,
+            dismissed: usize,
+        }
+
+        struct PickerOverControl {
+            observed: Rc<RefCell<Observed>>,
+        }
+
+        impl Render for PickerOverControl {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let observed = self.observed.clone();
+                let hovered = self.observed.clone();
+                let chosen = self.observed.clone();
+                let dismissed = self.observed.clone();
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(220.0))
+                            .child(disclosure_button("Automatic").id("anchor"))
+                            .child(deferred(microphone_picker_menu(
+                                vec![None, Some("Studio Microphone".into())],
+                                None,
+                                None,
+                                move |device, _, _| {
+                                    chosen.borrow_mut().chosen = Some(device.clone());
+                                },
+                                move |_, _, _| dismissed.borrow_mut().dismissed += 1,
+                            )))
+                            .child(
+                                div()
+                                    .id("beneath")
+                                    .debug_selector(|| "beneath".into())
+                                    .w(px(220.0))
+                                    .h(px(120.0))
+                                    .on_hover(move |is_hovered, _, _| {
+                                        if *is_hovered {
+                                            hovered.borrow_mut().beneath_hovered = true;
+                                        }
+                                    })
+                                    .on_click(move |_, _, _| {
+                                        observed.borrow_mut().beneath_clicks += 1;
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("outside")
+                            .debug_selector(|| "outside".into())
+                            .w(px(220.0))
+                            .h(px(200.0)),
+                    )
+            }
+        }
+
+        let observed = Rc::new(RefCell::new(Observed::default()));
+        let (_, cx) = cx.add_window_view(|_, _| PickerOverControl {
+            observed: observed.clone(),
+        });
+        cx.update(|window, cx| {
+            window.activate_window();
+            assert!(cx.active_window() == Some(window.window_handle()));
+        });
+        cx.run_until_parked();
+        let beneath = cx.debug_bounds("beneath").unwrap();
+        let menu = cx.debug_bounds("microphone-picker").unwrap();
+        let second_choice = cx.debug_bounds("microphone-choice-1").unwrap();
+        assert!(
+            menu.contains(&second_choice.center()) && beneath.contains(&second_choice.center()),
+            "fixture must place a menu choice over the control beneath"
+        );
+
+        cx.simulate_mouse_move(second_choice.center(), None, GpuiModifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !observed.borrow().beneath_hovered,
+            "hover leaked beneath the menu"
+        );
+
+        cx.simulate_click(second_choice.center(), GpuiModifiers::default());
+        cx.run_until_parked();
+        {
+            let observed = observed.borrow();
+            assert_eq!(observed.beneath_clicks, 0, "click leaked beneath the menu");
+            assert_eq!(observed.chosen, Some(Some("Studio Microphone".into())));
+            assert_eq!(
+                observed.dismissed, 0,
+                "choosing must not also count as dismissal"
+            );
+        }
+
+        let outside = cx.debug_bounds("outside").unwrap();
+        cx.simulate_click(outside.center(), GpuiModifiers::default());
+        cx.run_until_parked();
+        assert_eq!(observed.borrow().dismissed, 1);
     }
 
     #[test]
