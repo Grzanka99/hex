@@ -306,42 +306,18 @@ enum DevCommand {
     /// Drive a deterministic HUD state.
     Hud {
         #[arg(value_enum)]
-        state: DevHudState,
+        state: developer_control::DeveloperHudState,
     },
     /// Open the app and select a pane.
     Show {
         #[arg(value_enum)]
-        pane: DevPane,
+        pane: developer_control::DeveloperPane,
     },
     /// Enable or disable voice commands.
     Commands {
         #[arg(value_enum)]
         state: DevToggle,
     },
-}
-
-#[cfg(debug_assertions)]
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, ValueEnum)]
-enum DevHudState {
-    Reset,
-    Recording,
-    Transcribing,
-    Processing,
-}
-
-#[cfg(debug_assertions)]
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, ValueEnum)]
-enum DevPane {
-    Settings,
-    Modes,
-    VoiceAction,
-    Replacements,
-    HudLab,
-    Commands,
-    Meetings,
-    Activity,
 }
 
 #[cfg(debug_assertions)]
@@ -471,17 +447,19 @@ fn main() -> Result<()> {
                 return Err(eyre!("unsupported preview language: {language}"));
             }
             let pane = match target {
-                AppPreviewTarget::HudLab => app_window::PreviewPane::HudLab,
+                AppPreviewTarget::HudLab => developer_control::DeveloperPane::HudLab,
                 AppPreviewTarget::Onboarding
                 | AppPreviewTarget::Settings
-                | AppPreviewTarget::TranscriptionPicker => app_window::PreviewPane::Settings,
-                AppPreviewTarget::Modes => app_window::PreviewPane::Modes,
-                AppPreviewTarget::VoiceAction => app_window::PreviewPane::VoiceAction,
-                AppPreviewTarget::Replacements => app_window::PreviewPane::Replacements,
-                AppPreviewTarget::Commands => app_window::PreviewPane::Commands,
-                AppPreviewTarget::Meetings => app_window::PreviewPane::Meetings,
-                AppPreviewTarget::Activity => app_window::PreviewPane::Activity,
-                AppPreviewTarget::History => app_window::PreviewPane::History,
+                | AppPreviewTarget::TranscriptionPicker => {
+                    developer_control::DeveloperPane::Settings
+                }
+                AppPreviewTarget::Modes => developer_control::DeveloperPane::Modes,
+                AppPreviewTarget::VoiceAction => developer_control::DeveloperPane::VoiceAction,
+                AppPreviewTarget::Replacements => developer_control::DeveloperPane::Replacements,
+                AppPreviewTarget::Commands => developer_control::DeveloperPane::Commands,
+                AppPreviewTarget::Meetings => developer_control::DeveloperPane::Meetings,
+                AppPreviewTarget::Activity => developer_control::DeveloperPane::Activity,
+                AppPreviewTarget::History => developer_control::DeveloperPane::History,
                 AppPreviewTarget::DictationHud => unreachable!(),
             };
             let model_state = match model_state {
@@ -604,32 +582,11 @@ fn main() -> Result<()> {
         Command::Status => dashboard::run(event_path, config::voice_control()),
         #[cfg(debug_assertions)]
         Command::Dev { command } => {
-            use developer_control::{
-                DeveloperCommand, DeveloperHudState as RpcHudState, DeveloperPane as RpcPane,
-                DeveloperReply,
-            };
+            use developer_control::{DeveloperCommand, DeveloperReply};
             let command = match command {
                 DevCommand::Status => DeveloperCommand::Status,
-                DevCommand::Hud { state } => DeveloperCommand::Hud {
-                    state: match state {
-                        DevHudState::Reset => RpcHudState::Reset,
-                        DevHudState::Recording => RpcHudState::Recording,
-                        DevHudState::Transcribing => RpcHudState::Transcribing,
-                        DevHudState::Processing => RpcHudState::Processing,
-                    },
-                },
-                DevCommand::Show { pane } => DeveloperCommand::ShowPane {
-                    pane: match pane {
-                        DevPane::Settings => RpcPane::Settings,
-                        DevPane::Modes => RpcPane::Modes,
-                        DevPane::VoiceAction => RpcPane::VoiceAction,
-                        DevPane::Replacements => RpcPane::Replacements,
-                        DevPane::HudLab => RpcPane::HudLab,
-                        DevPane::Commands => RpcPane::Commands,
-                        DevPane::Meetings => RpcPane::Meetings,
-                        DevPane::Activity => RpcPane::Activity,
-                    },
-                },
+                DevCommand::Hud { state } => DeveloperCommand::Hud { state },
+                DevCommand::Show { pane } => DeveloperCommand::ShowPane { pane },
                 DevCommand::Commands { state } => DeveloperCommand::SetCommandsEnabled {
                     enabled: matches!(state, DevToggle::On),
                 },
@@ -748,6 +705,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn developer_show_accepts_every_developer_pane_spelling() {
+        use super::{DevCommand, developer_control::DeveloperPane};
+
+        for (pane, expected) in [
+            ("hud-lab", DeveloperPane::HudLab),
+            ("voice-action", DeveloperPane::VoiceAction),
+            ("history", DeveloperPane::History),
+        ] {
+            let cli = Cli::try_parse_from(["hex", "dev", "show", pane]).unwrap();
+            let Some(Command::Dev {
+                command: DevCommand::Show { pane },
+            }) = cli.command
+            else {
+                panic!("expected dev show command");
+            };
+            assert_eq!(pane, expected);
+        }
+        assert!(Cli::try_parse_from(["hex", "dev", "show", "hudlab"]).is_err());
+        assert!(Cli::try_parse_from(["hex", "dev", "hud", "recording"]).is_ok());
     }
 
     #[test]

@@ -42,6 +42,7 @@ use crate::desktop_ui::{
     settings_row, settings_section_label, sidebar_frame, sliding_segmented_control,
     sliding_segmented_item, toggle, window_frame,
 };
+use crate::developer_control::DeveloperPane;
 use crate::dictation_indicator::{DictationIndicatorEvent, DictationIndicatorSender, HudTuning};
 use crate::dictation_processor::{ModelCatalog, ModelChoice};
 use crate::events::{
@@ -405,19 +406,6 @@ fn open_new(
 }
 
 #[derive(Clone, Copy)]
-pub enum PreviewPane {
-    HudLab,
-    Meetings,
-    Commands,
-    Activity,
-    History,
-    Modes,
-    VoiceAction,
-    Replacements,
-    Settings,
-}
-
-#[derive(Clone, Copy)]
 pub enum PreviewModelState {
     Actual,
     Installed,
@@ -428,7 +416,7 @@ pub enum PreviewModelState {
 
 #[derive(Clone)]
 pub struct AppWindowPreview {
-    pub pane: PreviewPane,
+    pub pane: DeveloperPane,
     pub transcription_picker: Option<(String, PreviewModelState)>,
     pub onboarding: bool,
     pub collapse_mode_processing: bool,
@@ -540,22 +528,7 @@ impl Pane {
         }
     }
 
-    fn from_preview(pane: PreviewPane) -> Self {
-        match pane {
-            PreviewPane::HudLab => Self::HudLab,
-            PreviewPane::Meetings => Self::Meetings,
-            PreviewPane::Commands => Self::Commands,
-            PreviewPane::Activity => Self::Activity,
-            PreviewPane::History => Self::History,
-            PreviewPane::Modes => Self::Modes,
-            PreviewPane::VoiceAction => Self::VoiceAction,
-            PreviewPane::Replacements => Self::Modes,
-            PreviewPane::Settings => Self::Settings,
-        }
-    }
-
-    fn from_developer(pane: crate::developer_control::DeveloperPane) -> Self {
-        use crate::developer_control::DeveloperPane;
+    fn from_developer(pane: DeveloperPane) -> Self {
         match pane {
             DeveloperPane::Settings => Self::Settings,
             DeveloperPane::Modes => Self::Modes,
@@ -569,8 +542,7 @@ impl Pane {
         }
     }
 
-    fn developer(self) -> crate::developer_control::DeveloperPane {
-        use crate::developer_control::DeveloperPane;
+    fn developer(self) -> DeveloperPane {
         match self {
             Self::Settings => DeveloperPane::Settings,
             Self::Modes => DeveloperPane::Modes,
@@ -740,10 +712,10 @@ enum ModelCatalogState {
     Failed(String),
 }
 
-struct OpenCodeUnavailableCopy<'a> {
+struct OpenCodeUnavailableCopy {
     title: &'static str,
     description: &'static str,
-    error: Option<&'a str>,
+    error: Option<String>,
     can_retry: bool,
     retry_label: &'static str,
     can_open_setup: bool,
@@ -758,7 +730,7 @@ enum OpenCodeFeature {
 fn opencode_unavailable_copy(
     state: &ModelCatalogState,
     feature: OpenCodeFeature,
-) -> Option<OpenCodeUnavailableCopy<'_>> {
+) -> Option<OpenCodeUnavailableCopy> {
     match state {
         ModelCatalogState::Loading => Some(OpenCodeUnavailableCopy {
             title: "Checking for OpenCode",
@@ -796,7 +768,7 @@ fn opencode_unavailable_copy(
         ModelCatalogState::Failed(error) => Some(OpenCodeUnavailableCopy {
             title: "OpenCode is unavailable",
             description: "HEX could not load the OpenCode model catalog.",
-            error: Some(error),
+            error: Some(error.clone()),
             can_retry: true,
             retry_label: "Retry",
             can_open_setup: false,
@@ -1148,7 +1120,10 @@ impl AppWindow {
                 settings.transcription.model = choice.model.id;
                 settings.transcription.language = language.clone();
             }
-            if matches!(preview.pane, PreviewPane::Modes | PreviewPane::Replacements) {
+            if matches!(
+                preview.pane,
+                DeveloperPane::Modes | DeveloperPane::Replacements
+            ) {
                 let mut mode = DictationMode {
                     name: "Work notes".into(),
                     applications: vec!["Zed".into()],
@@ -1334,7 +1309,7 @@ impl AppWindow {
         let history = if preview_mode {
             preview
                 .as_ref()
-                .is_some_and(|preview| matches!(preview.pane, PreviewPane::History))
+                .is_some_and(|preview| matches!(preview.pane, DeveloperPane::History))
                 .then(preview_history)
                 .flatten()
         } else {
@@ -1344,9 +1319,9 @@ impl AppWindow {
         let command_search = Self::command_search_input(cx);
         let mut window = Self {
             preview: preview_mode,
-            pane: preview
-                .as_ref()
-                .map_or(Pane::default(), |preview| Pane::from_preview(preview.pane)),
+            pane: preview.as_ref().map_or(Pane::default(), |preview| {
+                Pane::from_developer(preview.pane)
+            }),
             event_reader: EventReader::open(event_path),
             activity: DesktopActivity::default(),
             meeting_requests,
@@ -1439,7 +1414,10 @@ impl AppWindow {
             {
                 ModeSelection::Default
             } else if preview.as_ref().is_some_and(|preview| {
-                matches!(preview.pane, PreviewPane::Modes | PreviewPane::Replacements)
+                matches!(
+                    preview.pane,
+                    DeveloperPane::Modes | DeveloperPane::Replacements
+                )
             }) {
                 ModeSelection::Custom(0)
             } else {
@@ -1603,15 +1581,11 @@ impl AppWindow {
         cx.notify();
     }
 
-    pub(crate) fn developer_select_pane(
-        &mut self,
-        pane: crate::developer_control::DeveloperPane,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn developer_select_pane(&mut self, pane: DeveloperPane, cx: &mut Context<Self>) {
         self.select_pane(Pane::from_developer(pane), cx);
     }
 
-    pub(crate) fn developer_pane(&self) -> crate::developer_control::DeveloperPane {
+    pub(crate) fn developer_pane(&self) -> DeveloperPane {
         self.pane.developer()
     }
 
@@ -3946,33 +3920,20 @@ impl AppWindow {
         } else if let Some(copy) =
             opencode_unavailable_copy(&self.model_catalog, OpenCodeFeature::VoiceAction)
         {
-            let error = copy.error.map(str::to_owned);
             let show_actions = copy.can_retry || copy.can_open_setup;
-            let retry_label = copy.retry_label;
-            let actions = div()
-                .mt_4()
-                .flex()
-                .gap_2()
-                .when(copy.can_retry, |actions| {
-                    actions.child(header_button(retry_label).id("retry-opencode").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.reload_model_catalog();
-                            cx.notify();
-                        }),
-                    ))
-                })
-                .when(copy.can_open_setup, |actions| {
-                    actions.child(
-                        header_button("Open OpenCode setup")
-                            .id("open-opencode-setup")
-                            .on_click(|_, _, _| open_opencode_beta_docs()),
-                    )
-                });
+            let actions = Self::opencode_unavailable_actions(
+                &copy,
+                "retry-opencode",
+                "open-opencode-setup",
+                "Open OpenCode setup",
+                cx,
+            )
+            .mt_4();
             Some(
                 compact_panel()
                     .p_5()
                     .child(settings_copy(copy.title, copy.description))
-                    .when_some(error, |card, error| {
+                    .when_some(copy.error, |card, error| {
                         card.child(
                             div()
                                 .mt_3()
@@ -4487,18 +4448,7 @@ impl AppWindow {
         let processing_enabled = self.selected_mode_settings().post_processing.enabled;
         let processing_can_toggle = processing_enabled || self.opencode_available();
         let processing_unavailable =
-            opencode_unavailable_copy(&self.model_catalog, OpenCodeFeature::Transformation).map(
-                |copy| {
-                    (
-                        copy.title,
-                        copy.description,
-                        copy.error.map(str::to_owned),
-                        copy.can_retry,
-                        copy.retry_label,
-                        copy.can_open_setup,
-                    )
-                },
-            );
+            opencode_unavailable_copy(&self.model_catalog, OpenCodeFeature::Transformation);
         let corrections = self.render_mode_replacements(selection, cx);
         let transformations = self.render_mode_transformations(selection, cx);
         let application_picker =
@@ -4590,63 +4540,53 @@ impl AppWindow {
                 cx,
             )
         });
-        let processing_unavailable = processing_unavailable.map(
-            |(title, description, error, can_retry, retry_label, can_open_setup)| {
-                let actions = div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(can_retry, |actions| {
-                        actions.child(
-                            header_button(retry_label)
-                                .id("retry-mode-opencode")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.reload_model_catalog();
-                                    cx.notify();
-                                })),
+        let processing_unavailable = processing_unavailable.map(|copy| {
+            let show_actions = copy.can_retry || copy.can_open_setup;
+            let actions = Self::opencode_unavailable_actions(
+                &copy,
+                "retry-mode-opencode",
+                "open-mode-opencode-setup",
+                "Open setup",
+                cx,
+            )
+            .items_center();
+            div()
+                .px_3()
+                .py_3()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap_4()
+                .border_t_1()
+                .border_color(rgb(LINE))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT_SOFT))
+                                .child(copy.title),
                         )
-                    })
-                    .when(can_open_setup, |actions| {
-                        actions.child(
-                            header_button("Open setup")
-                                .id("open-mode-opencode-setup")
-                                .on_click(|_, _, _| open_opencode_beta_docs()),
-                        )
-                    });
-                div()
-                    .px_3()
-                    .py_3()
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .gap_4()
-                    .border_t_1()
-                    .border_color(rgb(LINE))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_SOFT))
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .line_height(px(16.0))
-                                    .text_color(rgb(if error.is_some() { NEGATIVE } else { FAINT }))
-                                    .child(error.unwrap_or_else(|| description.into())),
-                            ),
-                    )
-                    .when(can_retry || can_open_setup, |notice| notice.child(actions))
-            },
-        );
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .line_height(px(16.0))
+                                .text_color(rgb(if copy.error.is_some() {
+                                    NEGATIVE
+                                } else {
+                                    FAINT
+                                }))
+                                .child(copy.error.unwrap_or_else(|| copy.description.into())),
+                        ),
+                )
+                .when(show_actions, |notice| notice.child(actions))
+        });
         let processing = compact_panel()
             .child(
                 compact_panel_header("OpenCode transformation", Some(processing_toggle)).when(
@@ -5603,6 +5543,35 @@ impl AppWindow {
     /// pickers presented in the pane's setting-row language. The processing
     /// deadline is not configurable here; Voice Action uses the persisted
     /// default.
+    fn opencode_unavailable_actions(
+        copy: &OpenCodeUnavailableCopy,
+        retry_id: &'static str,
+        setup_id: &'static str,
+        setup_label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        div()
+            .flex()
+            .gap_2()
+            .when(copy.can_retry, |actions| {
+                actions.child(
+                    header_button(copy.retry_label)
+                        .id(retry_id)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reload_model_catalog();
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(copy.can_open_setup, |actions| {
+                actions.child(
+                    header_button(setup_label)
+                        .id(setup_id)
+                        .on_click(|_, _, _| open_opencode_beta_docs()),
+                )
+            })
+    }
+
     fn render_voice_action_processing(
         &mut self,
         window: &mut Window,
@@ -8700,7 +8669,10 @@ mod tests {
             assert_eq!(Pane::VoiceAction.on_reopen(status), Pane::Settings);
             assert_eq!(Pane::Settings.on_reopen(status), Pane::Settings);
         }
-        assert_eq!(Pane::from_preview(PreviewPane::Modes), Pane::Modes);
+        assert_eq!(
+            Pane::from_developer(DeveloperPane::Replacements),
+            Pane::Modes
+        );
     }
 
     #[test]
@@ -9248,7 +9220,7 @@ mod tests {
             "HEX could not load the OpenCode model catalog."
         );
         assert_eq!(
-            copy.error,
+            copy.error.as_deref(),
             Some("OpenCode /api/model failed: config.providers was invalid")
         );
         assert!(copy.can_retry);
@@ -9296,7 +9268,7 @@ mod tests {
         let failed = ModelCatalogState::Failed("catalog failure".into());
         let error = opencode_unavailable_copy(&failed, OpenCodeFeature::Transformation).unwrap();
         assert_eq!(error.title, "OpenCode is unavailable");
-        assert_eq!(error.error, Some("catalog failure"));
+        assert_eq!(error.error.as_deref(), Some("catalog failure"));
         assert!(error.can_retry);
         assert!(!error.can_open_setup);
         let loaded = ModelCatalogState::Loaded(ModelCatalog {

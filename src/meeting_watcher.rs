@@ -319,9 +319,12 @@ fn run_with_shell_preview(
     let reopen_preview = shell_preview.clone();
     let reopen_history = history.clone();
     let reopen_indicator = indicator_sender.clone();
-    let indicator_enabled = shell_preview
-        .as_ref()
-        .is_none_or(|preview| matches!(preview.pane, crate::app_window::PreviewPane::HudLab));
+    let indicator_enabled = shell_preview.as_ref().is_none_or(|preview| {
+        matches!(
+            preview.pane,
+            crate::developer_control::DeveloperPane::HudLab
+        )
+    });
     let application = Application::new();
     application.on_reopen(move |cx| {
         let result = match reopen_preview.clone() {
