@@ -32,13 +32,13 @@ use crate::desktop_transcription_picker::{
     transcription_selection_is_active,
 };
 use crate::desktop_ui::{
-    ACCENT, CANVAS, COMPACT_MULTILINE_INPUT_HEIGHT, CONTROL_HEIGHT, FAINT, LINE, MUTED, NEGATIVE,
-    NavigationIcon, PANE_CONTENT_WIDTH, PANE_LIST_WIDTH, SECTION_GAP, SIDEBAR_WIDTH, SURFACE,
+    ACCENT, CANVAS, CONTROL_HEIGHT, FAINT, LINE, MUTED, NEGATIVE, NavigationIcon,
+    PANE_CONTENT_WIDTH, PANE_LIST_WIDTH, PANEL_RADIUS, SECTION_GAP, SIDEBAR_WIDTH, SURFACE,
     SURFACE_HOVER, SURFACE_SELECTED, TEXT, TEXT_INPUT_HEIGHT, TEXT_SOFT, compact_button,
     compact_header_plus_button, compact_panel, compact_panel_header, compact_plus_button,
     compact_section_label, disclosure_button, empty_message, error_message, header_button,
-    hotkey_keycaps, listener_status, mix_color, navigation_item, pane_body, pane_content,
-    pane_header, pane_header_with_action, section_label, settings_copy, settings_panel,
+    hotkey_keycaps, list_row, listener_status, mix_color, navigation_item, pane_body, pane_content,
+    pane_header, pane_header_with_action, pane_list, section_label, settings_copy, settings_panel,
     settings_row, settings_section_label, sidebar_frame, sliding_segmented_control,
     sliding_segmented_item, toggle, window_frame,
 };
@@ -2305,33 +2305,32 @@ impl AppWindow {
                         .flex_row()
                         .gap_5()
                         .child(
-                            compact_panel()
-                                .id("history-list")
-                                .w(px(PANE_LIST_WIDTH))
-                                .h_full()
-                                .flex_none()
-                                .overflow_y_scroll()
-                                .when(retention_off, |list| {
-                                    list.child(empty_message(
-                                        "History is off. New dictations are not retained.",
-                                    ))
-                                })
-                                .when(
-                                    !retention_off
-                                        && self.history_entries.is_empty()
-                                        && self.history_error.is_none(),
-                                    |list| list.child(empty_message("No dictations retained yet.")),
-                                )
-                                .when_some(self.history_error.clone(), |list, error| {
-                                    list.child(error_message("History could not be loaded.", error))
-                                })
-                                .child(
-                                    div()
-                                        .w(px(PANE_LIST_WIDTH - 2.0))
-                                        .flex()
-                                        .flex_col()
-                                        .children(rows),
-                                ),
+                            pane_list(
+                                "history-list",
+                                if retention_off {
+                                    Some("History is off. New dictations are not retained.")
+                                } else if self.history_entries.is_empty()
+                                    && self.history_error.is_none()
+                                {
+                                    Some("No dictations retained yet.")
+                                } else {
+                                    None
+                                },
+                                "History could not be loaded.",
+                                self.history_error.clone(),
+                            )
+                            .rounded(px(PANEL_RADIUS))
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .bg(rgb(SURFACE))
+                            .overflow_x_hidden()
+                            .child(
+                                div()
+                                    .w(px(PANE_LIST_WIDTH - 2.0))
+                                    .flex()
+                                    .flex_col()
+                                    .children(rows),
+                            ),
                         )
                         .child(
                             compact_panel()
@@ -4074,11 +4073,10 @@ impl AppWindow {
 
     fn transcription_hints_input(initial: &str, cx: &mut Context<Self>) -> ProcessingInput {
         let entity = cx.new(|cx| {
-            TextInput::multiline_with_height(
+            TextInput::multiline(
                 cx,
                 "Names and terms Whisper should expect, e.g. OpenCode, Effect...",
                 initial,
-                px(COMPACT_MULTILINE_INPUT_HEIGHT),
             )
         });
         let subscription = cx.subscribe(&entity, |this, _, _: &TextChanged, cx| {
@@ -4178,11 +4176,7 @@ impl AppWindow {
             }
         });
         let dismissed = cx.subscribe(&entity, |this, _, _: &TextDismissed, cx| {
-            this.application_picker_open = false;
-            this.application_picker_highlight = 0;
-            this.application_search
-                .entity
-                .update(cx, |input, cx| input.set_text("", cx));
+            this.close_application_picker(cx);
             cx.notify();
         });
         ProcessingInput {
@@ -4196,14 +4190,7 @@ impl AppWindow {
         initial: &str,
         cx: &mut Context<Self>,
     ) -> ProcessingInput {
-        let entity = cx.new(|cx| {
-            TextInput::multiline_with_height(
-                cx,
-                placeholder,
-                initial,
-                px(COMPACT_MULTILINE_INPUT_HEIGHT),
-            )
-        });
+        let entity = cx.new(|cx| TextInput::multiline(cx, placeholder, initial));
         Self::synchronized_processing_input(entity, cx)
     }
 
@@ -4533,7 +4520,7 @@ impl AppWindow {
         let processing_settings = processing_enabled.then(|| {
             self.render_processing_settings(
                 ModelPickerTarget::Mode(selection),
-                Some(prompt),
+                prompt,
                 model,
                 deadline,
                 window,
@@ -5075,11 +5062,7 @@ impl AppWindow {
                                 .hover(|button| button.bg(rgb(SURFACE_HOVER)))
                                 .child("Done")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.application_picker_open = false;
-                                    this.application_picker_highlight = 0;
-                                    this.application_search
-                                        .entity
-                                        .update(cx, |input, cx| input.set_text("", cx));
+                                    this.close_application_picker(cx);
                                     window.blur();
                                     cx.notify();
                                 })),
@@ -5622,7 +5605,7 @@ impl AppWindow {
     fn render_processing_settings(
         &mut self,
         target: ModelPickerTarget,
-        prompt: Option<Entity<TextInput>>,
+        prompt: Entity<TextInput>,
         model: Entity<TextInput>,
         deadline: Entity<TextInput>,
         window: &mut Window,
@@ -5678,7 +5661,7 @@ impl AppWindow {
                         div()
                             .when(!compact, |field| field.w(px(150.0)).flex_none())
                             .when(compact, |field| field.w_full())
-                            .child(settings_input("Deadline", "Seconds", deadline)),
+                            .child(settings_control("Deadline", "Seconds", deadline)),
                     ),
             )
             .when(has_variants, |processing| {
@@ -5697,13 +5680,11 @@ impl AppWindow {
                         .child(div().flex().child(variant_control)),
                 )
             })
-            .when_some(prompt, |processing, prompt| {
-                processing.child(settings_input(
-                    "Instructions",
-                    "Tell OpenCode exactly how to transform the dictated text.",
-                    prompt,
-                ))
-            })
+            .child(settings_control(
+                "Instructions",
+                "Tell OpenCode exactly how to transform the dictated text.",
+                prompt,
+            ))
             .into_any_element()
     }
 
@@ -5786,19 +5767,23 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         self.selected_mode = selection;
-        self.application_picker_open = false;
+        self.close_application_picker(cx);
         self.application_picker_error = None;
         self.transformation_picker_open = false;
         self.variant_picker_open = None;
-        self.application_picker_highlight = 0;
         self.model_picker_highlight = 0;
         self.mode_delete_armed = false;
         self.mode_context_menu = None;
+        window.blur();
+        cx.notify();
+    }
+
+    fn close_application_picker(&mut self, cx: &mut Context<Self>) {
+        self.application_picker_open = false;
+        self.application_picker_highlight = 0;
         self.application_search
             .entity
             .update(cx, |input, cx| input.set_text("", cx));
-        window.blur();
-        cx.notify();
     }
 
     fn mode_inputs_mut(&mut self, selection: ModeSelection) -> &mut ModeInputs {
@@ -5942,22 +5927,16 @@ impl AppWindow {
             })
             .collect();
 
-        let list = div()
-            .id("meetings-list")
-            .w(px(PANE_LIST_WIDTH))
-            .h_full()
-            .flex_none()
-            .overflow_y_scroll()
-            .border_r_1()
-            .border_color(rgb(LINE))
-            .when(
-                self.meetings.is_empty() && self.meetings_error.is_none(),
-                |list| list.child(empty_message("No meetings yet.")),
-            )
-            .when_some(self.meetings_error.clone(), |list, error| {
-                list.child(error_message("Meetings could not be loaded.", error))
-            })
-            .children(rows);
+        let list = pane_list(
+            "meetings-list",
+            (self.meetings.is_empty() && self.meetings_error.is_none())
+                .then_some("No meetings yet."),
+            "Meetings could not be loaded.",
+            self.meetings_error.clone(),
+        )
+        .border_r_1()
+        .border_color(rgb(LINE))
+        .children(rows);
 
         div()
             .size_full()
@@ -6386,19 +6365,8 @@ impl AppWindow {
                         let command = self.commands[index].clone();
                         let command_id = command.id.clone();
                         let selected = effective_selected.as_deref() == Some(command_id.as_str());
-                        div()
+                        list_row(selected)
                             .id(("command", index))
-                            .w_full()
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .rounded(px(6.0))
-                            .when(selected, |row| {
-                                row.bg(rgb(0x292929)).hover(|row| row.bg(rgb(0x303030)))
-                            })
-                            .when(!selected, |row| row.hover(|row| row.bg(rgb(SURFACE_HOVER))))
                             .child(
                                 div()
                                     .w_full()
@@ -6696,25 +6664,16 @@ impl AppWindow {
                     pane_content()
                         .flex_row()
                         .child(
-                            div()
-                                .id("activity-list")
-                                .w(px(PANE_LIST_WIDTH))
-                                .h_full()
-                                .flex_none()
-                                .overflow_y_scroll()
-                                .border_r_1()
-                                .border_color(rgb(LINE))
-                                .when(
-                                    self.events.is_empty() && self.activity.error.is_none(),
-                                    |list| list.child(empty_message("No activity yet.")),
-                                )
-                                .when_some(self.activity.error.clone(), |list, error| {
-                                    list.child(error_message(
-                                        "Activity could not be loaded.",
-                                        error,
-                                    ))
-                                })
-                                .children(rows),
+                            pane_list(
+                                "activity-list",
+                                (self.events.is_empty() && self.activity.error.is_none())
+                                    .then_some("No activity yet."),
+                                "Activity could not be loaded.",
+                                self.activity.error.clone(),
+                            )
+                            .border_r_1()
+                            .border_color(rgb(LINE))
+                            .children(rows),
                         )
                         .child(self.render_event_detail()),
                 ),
@@ -6863,17 +6822,7 @@ impl AppWindow {
                 light_angle: 0.35,
                 outline: 0.25,
             },
-            1 => HudTuning {
-                style: 1.0,
-                line_count: 2.0,
-                curvature: 0.47,
-                speed: 17.08,
-                sharpness: 0.29,
-                glow: 0.77,
-                depth: 0.65,
-                light_angle: 0.35,
-                outline: 1.0,
-            },
+            1 => HudTuning::default(),
             _ => HudTuning {
                 style: 2.0,
                 line_count: 3.0,
@@ -7707,21 +7656,10 @@ fn mode_row(
     let title = title.into();
     let subtitle = subtitle.into();
     let has_activations = !applications.is_empty() || !browser_hosts.is_empty();
-    div()
-        .w_full()
+    list_row(selected)
         .min_h(px(52.0))
-        .px_3()
-        .py_2()
-        .flex()
-        .flex_col()
         .items_start()
         .justify_center()
-        .gap_1()
-        .rounded(px(6.0))
-        .when(selected, |row| {
-            row.bg(rgb(0x292929)).hover(|row| row.bg(rgb(0x303030)))
-        })
-        .when(!selected, |row| row.hover(|row| row.bg(rgb(SURFACE_HOVER))))
         .child(
             div()
                 .w_full()
@@ -7990,14 +7928,6 @@ fn model_choice_row(
                 .text_color(rgb(FAINT))
                 .child(subtitle.into()),
         )
-}
-
-fn settings_input(
-    label: &'static str,
-    description: impl Into<String>,
-    input: Entity<TextInput>,
-) -> AnyElement {
-    settings_control(label, description, input)
 }
 
 fn compact_mode_field(label: &'static str, control: impl IntoElement) -> Div {

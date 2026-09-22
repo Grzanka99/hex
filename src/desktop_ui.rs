@@ -1,4 +1,7 @@
-use gpui::{AnyElement, Div, FontWeight, IntoElement, Rgba, div, prelude::*, px, rgb, rgba};
+use gpui::{
+    AnyElement, Div, ElementId, FontWeight, IntoElement, Rgba, Stateful, div, prelude::*, px, rgb,
+    rgba,
+};
 
 #[cfg(target_os = "linux")]
 use gpui::{Image, ImageFormat, img};
@@ -131,8 +134,7 @@ pub(crate) const NEGATIVE: u32 = 0xc98f89;
 
 pub(crate) const CONTROL_HEIGHT: f32 = 32.0;
 pub(crate) const TEXT_INPUT_HEIGHT: f32 = 34.0;
-pub(crate) const MULTILINE_INPUT_HEIGHT: f32 = 132.0;
-pub(crate) const COMPACT_MULTILINE_INPUT_HEIGHT: f32 = 76.0;
+pub(crate) const MULTILINE_INPUT_HEIGHT: f32 = 76.0;
 pub(crate) const PANEL_RADIUS: f32 = 10.0;
 pub(crate) const COMPACT_PANEL_HEADER_HEIGHT: f32 = 38.0;
 pub(crate) const SECTION_GAP: f32 = 8.0;
@@ -189,6 +191,47 @@ pub(crate) const PANE_CONTENT_WIDTH: f32 = 940.0;
 
 /// The one fixed list-column width every list+detail pane uses.
 pub(crate) const PANE_LIST_WIDTH: f32 = 320.0;
+
+/// The one list column of a list+detail pane: fixed to [`PANE_LIST_WIDTH`],
+/// scrolling, with the pane's empty notice and load error ahead of its rows.
+/// Callers decide when `empty` applies and append their rows.
+pub(crate) fn pane_list(
+    id: impl Into<ElementId>,
+    empty: Option<&'static str>,
+    error_title: &'static str,
+    error: Option<String>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(PANE_LIST_WIDTH))
+        .h_full()
+        .flex_none()
+        .overflow_y_scroll()
+        .when_some(empty, |list, message| list.child(empty_message(message)))
+        .when_some(error, |list, error| {
+            list.child(error_message(error_title, error))
+        })
+}
+
+const LIST_ROW_SELECTED: u32 = 0x292929;
+const LIST_ROW_SELECTED_HOVER: u32 = 0x303030;
+
+/// A rounded, selectable row inside a list column.
+pub(crate) fn list_row(selected: bool) -> Div {
+    div()
+        .w_full()
+        .px_3()
+        .py_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .rounded(px(6.0))
+        .when(selected, |row| {
+            row.bg(rgb(LIST_ROW_SELECTED))
+                .hover(|row| row.bg(rgb(LIST_ROW_SELECTED_HOVER)))
+        })
+        .when(!selected, |row| row.hover(|row| row.bg(rgb(SURFACE_HOVER))))
+}
 
 pub(crate) fn pane_header(title: &'static str) -> AnyElement {
     pane_header_with_action(title, None)
