@@ -18,6 +18,7 @@ use crate::text_replacements::ReplacementSet;
 
 const PROTOCOL_PROMPT: &str = "You transform dictated speech into replacement text. Return only the text that should be pasted. Do not add an explanation, label, alternative, or Markdown fence.";
 const VOICE_ACTION_PROTOCOL_PROMPT: &str = "You execute a one-off voice instruction. When selected text is provided, transform or use it as instructed. When no text is selected, generate the requested text. Return only the exact paste-ready result without an explanation, label, alternative, or Markdown fence.";
+const VOICE_ACTION_PROFILE: &str = "Voice Action";
 const MAX_OPENCODE_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 /// Newest service info route first; older OpenCode V2 builds only serve the later names.
 const SERVICE_INFO_ENDPOINTS: [&str; 3] = ["/api/info", "/api/status", "/api/health"];
@@ -30,7 +31,7 @@ pub struct Profile {
     ai_enabled: bool,
     prompt: String,
     model: Option<Model>,
-    deadline: Option<Duration>,
+    deadline: Duration,
     replacements: ReplacementSet,
     transformations: Vec<String>,
 }
@@ -42,7 +43,7 @@ impl Profile {
             ai_enabled: false,
             prompt: prompt.into(),
             model: None,
-            deadline: None,
+            deadline: Duration::from_secs(30),
             replacements: ReplacementSet::default(),
             transformations: Vec::new(),
         }
@@ -81,7 +82,7 @@ impl Profile {
     }
 
     pub fn deadline(mut self, deadline: Duration) -> Self {
-        self.deadline = Some(deadline);
+        self.deadline = deadline;
         self
     }
 }
@@ -104,7 +105,6 @@ struct ContextualProfile {
 #[derive(Clone)]
 pub struct Profiles {
     default: Profile,
-    deadline: Duration,
     contextual: Vec<ContextualProfile>,
 }
 
@@ -112,14 +112,8 @@ impl Profiles {
     pub fn new(default: Profile) -> Self {
         Self {
             default,
-            deadline: Duration::from_secs(30),
             contextual: Vec::new(),
         }
-    }
-
-    pub fn deadline(mut self, deadline: Duration) -> Self {
-        self.deadline = deadline;
-        self
     }
 
     pub fn application(self, application: impl Into<String>, profile: Profile) -> Self {
@@ -180,44 +174,25 @@ impl Profiles {
             };
         }
         let prompt = prompt(profile, &corrected, context);
-        let deadline = profile.deadline.unwrap_or(self.deadline);
-        let started = Instant::now();
-        match generate_cancellable(&prompt, profile.model.as_ref(), deadline, cancelled) {
-            Ok(text) if !text.trim().is_empty() => {
-                let latency_ms = started.elapsed().as_millis() as u64;
-                tracing::info!(
-                    profile = profile.name,
-                    latency_ms,
-                    "dictation post-processing completed"
-                );
-                Processed {
-                    text: text.trim().into(),
-                    observation: Some(ProcessingObservation {
-                        profile: profile.name.clone(),
-                        latency_ms,
-                        fallback: None,
-                    }),
-                    transformations: profile.transformations.clone(),
-                }
-            }
-            Ok(_) => Processed {
-                text: corrected.clone(),
-                observation: Some(ProcessingObservation {
-                    profile: profile.name.clone(),
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    fallback: Some("processor returned empty text".into()),
-                }),
-                transformations: profile.transformations.clone(),
-            },
-            Err(error) => Processed {
-                text: corrected,
-                observation: Some(ProcessingObservation {
-                    profile: profile.name.clone(),
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    fallback: Some(error.to_string()),
-                }),
-                transformations: profile.transformations.clone(),
-            },
+        let (text, observation) = generate_observed(
+            &prompt,
+            profile.model.as_ref(),
+            profile.deadline,
+            cancelled,
+            &profile.name,
+            Instant::now(),
+        );
+        if observation.fallback.is_none() {
+            tracing::info!(
+                profile = profile.name,
+                latency_ms = observation.latency_ms,
+                "dictation post-processing completed"
+            );
+        }
+        Processed {
+            text: text.unwrap_or(corrected),
+            observation: Some(observation),
+            transformations: profile.transformations.clone(),
         }
     }
 
@@ -248,24 +223,50 @@ impl Profiles {
                 })
             }
         };
-        match generate_cancellable(&prompt, model.as_ref(), deadline, cancelled) {
-            Ok(text) if !text.trim().is_empty() => {
-                let latency_ms = started.elapsed().as_millis() as u64;
-                tracing::info!(latency_ms, "voice action completed");
-                Processed {
-                    text: text.trim().into(),
-                    observation: Some(ProcessingObservation {
-                        profile: "Voice Action".into(),
-                        latency_ms,
-                        fallback: None,
-                    }),
-                    transformations: Vec::new(),
-                }
-            }
-            Ok(_) => voice_action_failure(started, "processor returned empty text".into()),
-            Err(error) => voice_action_failure(started, error.to_string()),
+        let (text, observation) = generate_observed(
+            &prompt,
+            model.as_ref(),
+            deadline,
+            cancelled,
+            VOICE_ACTION_PROFILE,
+            started,
+        );
+        if observation.fallback.is_none() {
+            tracing::info!(
+                latency_ms = observation.latency_ms,
+                "voice action completed"
+            );
+        }
+        Processed {
+            text: text.unwrap_or_default(),
+            observation: Some(observation),
+            transformations: Vec::new(),
         }
     }
+}
+
+/// Runs one generation and reports it as a processing observation. The text is
+/// `None` whenever the caller must fall back, with the reason recorded in the
+/// observation.
+fn generate_observed(
+    prompt: &str,
+    model: Option<&Model>,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+    profile_name: &str,
+    started: Instant,
+) -> (Option<String>, ProcessingObservation) {
+    let (text, fallback) = match generate_cancellable(prompt, model, deadline, cancelled) {
+        Ok(text) if !text.trim().is_empty() => (Some(text.trim().into()), None),
+        Ok(_) => (None, Some("processor returned empty text".into())),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let observation = ProcessingObservation {
+        profile: profile_name.into(),
+        latency_ms: started.elapsed().as_millis() as u64,
+        fallback,
+    };
+    (text, observation)
 }
 
 #[derive(Clone, Debug)]
@@ -504,7 +505,7 @@ fn voice_action_failure(started: Instant, error: String) -> Processed {
     Processed {
         text: String::new(),
         observation: Some(ProcessingObservation {
-            profile: "Voice Action".into(),
+            profile: VOICE_ACTION_PROFILE.into(),
             latency_ms: started.elapsed().as_millis() as u64,
             fallback: Some(error),
         }),
@@ -924,58 +925,41 @@ fn run_command(
     let stdout = thread::spawn(move || read_output(stdout));
     let stderr = thread::spawn(move || read_output(stderr));
     let started = Instant::now();
-    let status = loop {
+    let outcome: Result<ExitStatus> = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
-            Err(error) => {
-                terminate_process_group(&mut child);
-                let _ = stdout.join();
-                let _ = stderr.join();
-                if let Some(input) = input {
-                    let _ = input.join();
-                }
-                return Err(error).wrap_err("could not inspect opencode2");
-            }
+            Err(error) => break Err(error).wrap_err("could not inspect opencode2"),
         }
         if cancelled.load(Ordering::Acquire) {
-            terminate_process_group(&mut child);
-            let _ = stdout.join();
-            let _ = stderr.join();
-            if let Some(input) = input {
-                let _ = input.join();
-            }
-            return Err(eyre!("opencode2 {operation} was cancelled"));
+            break Err(eyre!("opencode2 {operation} was cancelled"));
         }
         if started.elapsed() >= deadline {
-            terminate_process_group(&mut child);
-            let _ = stdout.join();
-            let _ = stderr.join();
-            if let Some(input) = input {
-                let _ = input.join();
-            }
-            return Err(eyre!(
+            break Err(eyre!(
                 "opencode2 {operation} exceeded {} seconds",
                 deadline.as_secs()
             ));
         }
         thread::sleep(Duration::from_millis(20));
     };
-    kill_process_group(child.id());
+    // An aborted child is torn down before the pipes are joined so blocked readers
+    // and the input writer observe EOF instead of holding the deadline open.
+    match &outcome {
+        Ok(_) => kill_process_group(child.id()),
+        Err(_) => terminate_process_group(&mut child),
+    }
+    let stdout = stdout.join();
+    let stderr = stderr.join();
+    let input = input.map(|input| input.join());
+    let status = outcome?;
     if let Some(input) = input {
-        let result = input
-            .join()
-            .map_err(|_| eyre!("OpenCode input writer panicked"))?;
+        let result = input.map_err(|_| eyre!("OpenCode input writer panicked"))?;
         if status.success() {
             result.wrap_err("could not write OpenCode request")?;
         }
     }
-    let stdout = stdout
-        .join()
-        .map_err(|_| eyre!("opencode2 stdout reader panicked"))??;
-    let stderr = stderr
-        .join()
-        .map_err(|_| eyre!("opencode2 stderr reader panicked"))??;
+    let stdout = stdout.map_err(|_| eyre!("opencode2 stdout reader panicked"))??;
+    let stderr = stderr.map_err(|_| eyre!("opencode2 stderr reader panicked"))??;
     Ok(CommandOutput {
         status,
         stdout,
@@ -1142,6 +1126,55 @@ mod tests {
             .browser_host("x.com", Profile::new("x", "x prompt"))
     }
 
+    fn fake_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Reads one authenticated request and returns its headers and body.
+    fn receive_request(stream: &mut std::net::TcpStream, start_line: &str) -> (String, Vec<u8>) {
+        use std::io::BufRead;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        assert!(
+            headers.starts_with(&format!("{start_line} HTTP/1.1\r\n")),
+            "{headers}"
+        );
+        assert!(headers.contains("Authorization: Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==\r\n"));
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        if headers
+            .to_ascii_lowercase()
+            .contains("expect: 100-continue")
+        {
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .unwrap();
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        (headers, body)
+    }
+
     #[test]
     fn standard_install_location_finds_opencode_outside_the_gui_path() {
         let root = std::env::temp_dir().join(format!(
@@ -1151,11 +1184,7 @@ mod tests {
         ));
         for location in [".opencode/bin/opencode2", "Library/pnpm/bin/opencode2"] {
             let executable = root.join(location);
-            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-            std::fs::write(&executable, "#!/bin/sh\n").unwrap();
-            let mut permissions = executable.metadata().unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&executable, permissions).unwrap();
+            fake_executable(&executable);
 
             let found = find_opencode_executable(
                 None,
@@ -1171,8 +1200,6 @@ mod tests {
 
     #[test]
     fn catalog_http_decodes_large_responses_with_private_auth_and_workspace_scope() {
-        use std::io::BufRead;
-
         let root = std::env::temp_dir().join(format!(
             "hex-opencode-workspace-{}-{:?}",
             std::process::id(),
@@ -1222,26 +1249,9 @@ mod tests {
             for (path, response) in [("/api/model", models), ("/api/model/default", default)] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                stream
                     .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                let mut reader = std::io::BufReader::new(&mut stream);
-                let mut headers = String::new();
-                loop {
-                    let mut line = String::new();
-                    assert!(reader.read_line(&mut line).unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    headers.push_str(&line);
-                }
-                assert!(headers.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
-                assert!(
-                    headers
-                        .contains("Authorization: Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==\r\n")
-                );
+                let (headers, _) = receive_request(&mut stream, &format!("GET {path}"));
                 assert!(headers.contains(&scope_header));
                 assert!(!headers.to_ascii_lowercase().contains("content-length:"));
                 write!(
@@ -1297,9 +1307,7 @@ mod tests {
         let path_executable = root.join("path/opencode2");
         let fallback = root.join(".bun/bin/opencode2");
         for executable in [&official, &path_executable, &fallback] {
-            fs::create_dir_all(executable.parent().unwrap()).unwrap();
-            fs::write(executable, "#!/bin/sh\n").unwrap();
-            fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+            fake_executable(executable);
         }
         let path = root.join("path");
         let find =
@@ -1326,11 +1334,7 @@ mod tests {
             thread::current().id()
         ));
         let executable = root.join(".nvm/versions/node/v24.4.1/bin/opencode2");
-        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
-        let mut permissions = executable.metadata().unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
+        fake_executable(&executable);
 
         let found = find_opencode_executable(None, None, Some(&root), Some(&root));
 
@@ -1833,48 +1837,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn receive_generation_request(stream: &mut std::net::TcpStream, path: &str) -> Vec<u8> {
-        use std::io::BufRead;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
-        let mut headers = String::new();
-        loop {
-            let mut line = String::new();
-            assert!(reader.read_line(&mut line).unwrap() > 0);
-            if line == "\r\n" {
-                break;
-            }
-            headers.push_str(&line);
-        }
-        assert!(
-            headers.starts_with(&format!("POST {path} HTTP/1.1\r\n")),
-            "{headers}"
-        );
-        assert!(headers.contains("Authorization: Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==\r\n"));
-        let length: usize = headers
-            .lines()
-            .find_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                key.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse().unwrap())
-            })
-            .unwrap();
-        if headers
-            .to_ascii_lowercase()
-            .contains("expect: 100-continue")
-        {
-            reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-                .unwrap();
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-        body
-    }
-
     /// Answers each expected route in order and returns the request bodies it saw.
     fn generation_server(
         routes: Vec<(&'static str, u16, &'static str)>,
@@ -1886,7 +1848,7 @@ mod tests {
                 .into_iter()
                 .map(|(path, status, response)| {
                     let (mut stream, _) = listener.accept().unwrap();
-                    let body = receive_generation_request(&mut stream, path);
+                    let (_, body) = receive_request(&mut stream, &format!("POST {path}"));
                     write!(
                         stream,
                         "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
@@ -2057,7 +2019,7 @@ mod tests {
             let flag = cancelled.clone();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                receive_generation_request(&mut stream, "/api/generate");
+                receive_request(&mut stream, "POST /api/generate");
                 flag.store(cancel, Ordering::Release);
                 let mut byte = [0];
                 assert_eq!(stream.read(&mut byte).unwrap(), 0);

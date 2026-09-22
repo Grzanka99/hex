@@ -43,7 +43,7 @@ mod dictation_diagnostics;
 #[cfg(target_os = "macos")]
 mod dictation_indicator;
 #[cfg(target_os = "macos")]
-pub mod dictation_processor;
+mod dictation_processor;
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 mod events;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
