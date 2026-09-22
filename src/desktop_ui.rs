@@ -1,4 +1,4 @@
-use gpui::{AnyElement, Div, FontWeight, IntoElement, Rgba, div, prelude::*, px, rgb};
+use gpui::{AnyElement, Div, FontWeight, IntoElement, Rgba, div, prelude::*, px, rgb, rgba};
 
 #[cfg(target_os = "linux")]
 use gpui::{Image, ImageFormat, img};
@@ -570,6 +570,46 @@ pub(crate) fn segmented_item(selected: bool) -> Div {
         })
 }
 
+/// A [`segmented_control`] whose selection indicator slides between items.
+/// `position` is a fractional item index and `widths` lists every item's
+/// width in order; append the items with [`sliding_segmented_item`].
+pub(crate) fn sliding_segmented_control(position: f32, widths: &[f32]) -> Div {
+    let (left, width) = segmented_geometry(position, widths);
+    segmented_control().relative().child(
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(2.0))
+            .w(px(width))
+            .h(px(26.0))
+            .rounded(px(4.0))
+            .bg(rgb(SURFACE_SELECTED)),
+    )
+}
+
+/// A fixed-width, centered item that stays transparent so the sliding
+/// indicator beneath it shows through.
+pub(crate) fn sliding_segmented_item(width: f32, selected: bool) -> Div {
+    segmented_item(selected)
+        .w(px(width))
+        .px(px(0.0))
+        .justify_center()
+        .bg(rgba(0x00000000))
+}
+
+fn segmented_geometry(position: f32, widths: &[f32]) -> (f32, f32) {
+    let last = widths.len().saturating_sub(1);
+    let position = position.clamp(0.0, last as f32);
+    let lower = (position.floor() as usize).min(last);
+    let upper = (lower + 1).min(last);
+    let progress = position - lower as f32;
+    let left = |index: usize| 2.0 + widths[..index].iter().sum::<f32>();
+    (
+        left(lower) + (left(upper) - left(lower)) * progress,
+        widths[lower] + (widths[upper] - widths[lower]) * progress,
+    )
+}
+
 pub(crate) fn mix_color(from: Rgba, to: Rgba, position: f32) -> Rgba {
     let position = position.clamp(0.0, 1.0);
     Rgba {
@@ -610,13 +650,25 @@ pub(crate) fn error_message(message: &'static str, error: String) -> AnyElement 
 
 #[cfg(test)]
 mod tests {
-    use super::split_sided_keycap;
+    use super::{segmented_geometry, split_sided_keycap};
 
     #[test]
     fn side_badges_only_apply_to_sided_modifiers() {
         assert_eq!(split_sided_keycap("L⌥"), (Some("L"), "⌥".into()));
         assert_eq!(split_sided_keycap("R⌘"), (Some("R"), "⌘".into()));
         assert_eq!(split_sided_keycap("Return"), (None, "Return".into()));
+    }
+
+    #[test]
+    fn segmented_indicator_interpolates_between_uneven_items() {
+        let widths = [50.0, 90.0, 80.0];
+        assert_eq!(segmented_geometry(0.0, &widths), (2.0, 50.0));
+        assert_eq!(segmented_geometry(1.0, &widths), (52.0, 90.0));
+        assert_eq!(segmented_geometry(2.0, &widths), (142.0, 80.0));
+        assert_eq!(segmented_geometry(0.5, &widths), (27.0, 70.0));
+        assert_eq!(segmented_geometry(-1.0, &widths), (2.0, 50.0));
+        assert_eq!(segmented_geometry(5.0, &widths), (142.0, 80.0));
+        assert_eq!(segmented_geometry(2.5, &[34.0; 5]), (87.0, 34.0));
     }
 }
 

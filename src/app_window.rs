@@ -38,9 +38,9 @@ use crate::desktop_ui::{
     compact_header_plus_button, compact_panel, compact_panel_header, compact_plus_button,
     compact_section_label, disclosure_button, empty_message, error_message, header_button,
     hotkey_keycaps, listener_status, mix_color, navigation_item, pane_body, pane_content,
-    pane_header, pane_header_with_action, section_label, segmented_control, segmented_item,
-    settings_copy, settings_panel, settings_row, settings_section_label, sidebar_frame, toggle,
-    window_frame,
+    pane_header, pane_header_with_action, section_label, settings_copy, settings_panel,
+    settings_row, settings_section_label, sidebar_frame, sliding_segmented_control,
+    sliding_segmented_item, toggle, window_frame,
 };
 use crate::dictation_indicator::{DictationIndicatorEvent, DictationIndicatorSender, HudTuning};
 use crate::dictation_processor::{ModelCatalog, ModelChoice};
@@ -1644,18 +1644,12 @@ impl AppWindow {
                 candidate.disable_commands_and_release_microphone()
             }
         }
-        if !self.preview {
-            candidate.save()?;
-        }
-        self.settings = candidate;
+        self.commit_settings(candidate)?;
         self.commands_toggle
             .set_enabled(self.settings.commands_enabled);
         self.release_microphone_toggle
             .set_enabled(self.settings.release_microphone_while_idle);
         self.pending_microphone_policy = None;
-        self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
-        self.settings_dirty = false;
-        self.settings_load_error = None;
         cx.notify();
         Ok(())
     }
@@ -2567,24 +2561,8 @@ impl AppWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let binding = match kind {
-            HotkeyKind::Dictation => &self.settings.dictation_hotkey,
-            HotkeyKind::Edit => &self.settings.edit_hotkey,
-            HotkeyKind::PasteLast => self
-                .settings
-                .paste_last_hotkey
-                .as_ref()
-                .unwrap_or(&self.settings.dictation_hotkey),
-        };
-        let binding_keycaps = match kind {
-            HotkeyKind::Dictation => self.snapshot().dictation_shortcut,
-            HotkeyKind::Edit => binding.keycaps(),
-            HotkeyKind::PasteLast => self
-                .settings
-                .paste_last_hotkey
-                .as_ref()
-                .map_or_else(|| vec!["Off".into()], HotkeyBinding::keycaps),
-        };
+        let binding_keycaps = hotkey_binding(&self.settings, kind)
+            .map_or_else(|| vec!["Off".into()], HotkeyBinding::keycaps);
         let idle_width = hotkey_idle_width(binding_keycaps.len());
         if matches!(
             self.hotkey_capture,
@@ -2780,7 +2758,7 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let hotkey = self.render_hotkey_control(kind, window, cx);
-        let side = self.hotkey_binding(kind).and_then(standalone_modifier_side);
+        let side = hotkey_binding(&self.settings, kind).and_then(standalone_modifier_side);
         let side_animation = &mut self.hotkey_side_animations[hotkey_kind_index(kind)];
         side_animation.set_enabled(side.is_some());
         let side_position = side_animation.render_position(window).clamp(0.0, 1.0);
@@ -2790,7 +2768,6 @@ impl AppWindow {
             &mut self.hotkey_side_selection_springs[hotkey_kind_index(kind)];
         side_selection_spring.set_target(hotkey_side_index(selected) as f32);
         let selection_position = side_selection_spring.render_position(window);
-        let (selection_left, selection_width) = segmented_geometry(selection_position, side_widths);
         let side_selector = div()
             .w(px(HOTKEY_SIDE_SELECTOR_WIDTH * side_position))
             .mr(px(8.0 * side_position))
@@ -2798,19 +2775,8 @@ impl AppWindow {
             .overflow_hidden()
             .opacity(side_position)
             .child(
-                segmented_control()
+                sliding_segmented_control(selection_position, &side_widths)
                     .w(px(HOTKEY_SIDE_SELECTOR_WIDTH))
-                    .relative()
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(selection_left))
-                            .top(px(2.0))
-                            .w(px(selection_width))
-                            .h(px(26.0))
-                            .rounded(px(4.0))
-                            .bg(rgb(SURFACE_SELECTED)),
-                    )
                     .children(
                         [
                             ("Left", ModifierSide::Left),
@@ -2821,13 +2787,8 @@ impl AppWindow {
                         .enumerate()
                         .map(|(index, (label, side))| {
                             let candidate = hotkey_side_binding(&self.settings, kind, side);
-                            segmented_item(selected == side)
+                            sliding_segmented_item(side_widths[index], selected == side)
                                 .id(("hotkey-side", hotkey_kind_index(kind) * 3 + index))
-                                .w(px(side_widths[index]))
-                                .h(px(26.0))
-                                .px(px(0.0))
-                                .justify_center()
-                                .bg(rgba(0x00000000))
                                 .text_size(px(9.0))
                                 .when(candidate.is_none(), |item| item.opacity(0.35))
                                 .child(label)
@@ -2857,14 +2818,6 @@ impl AppWindow {
             .child(side_selector)
             .child(hotkey)
             .into_any_element()
-    }
-
-    fn hotkey_binding(&self, kind: HotkeyKind) -> Option<&HotkeyBinding> {
-        match kind {
-            HotkeyKind::Dictation => Some(&self.settings.dictation_hotkey),
-            HotkeyKind::Edit => Some(&self.settings.edit_hotkey),
-            HotkeyKind::PasteLast => self.settings.paste_last_hotkey.as_ref(),
-        }
     }
 
     fn hotkey_binding_mut(&mut self, kind: HotkeyKind) -> Option<&mut HotkeyBinding> {
@@ -3402,56 +3355,40 @@ impl AppWindow {
             .microphone_picker_open
             .then(|| self.render_microphone_picker(cx));
         let sound_volume_position = self.sound_volume_spring.render_position(window);
-        let sound_volume = segmented_control()
-            .relative()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(2.0 + sound_volume_position * 34.0))
-                    .top(px(2.0))
-                    .w(px(34.0))
-                    .h(px(26.0))
-                    .rounded(px(4.0))
-                    .bg(rgb(SURFACE_SELECTED)),
-            )
-            .children(
-                [
-                    ("Off", 0.0_f32),
-                    ("25%", 0.25),
-                    ("50%", 0.5),
-                    ("75%", 0.75),
-                    ("100%", 1.0),
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(index, (label, volume))| {
-                    let selected = if volume == 0.0 {
-                        !self.settings.sound_effects
-                    } else {
-                        self.settings.sound_effects
-                            && (self.settings.sound_effect_volume - volume).abs() < 0.01
-                    };
-                    segmented_item(selected)
-                        .id(("sound-volume", index))
-                        .w(px(34.0))
-                        .px(px(0.0))
-                        .justify_center()
-                        .text_size(px(9.0))
-                        .bg(rgba(0x00000000))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.settings.sound_effects = volume > 0.0;
-                            if volume > 0.0 {
-                                this.settings.sound_effect_volume = volume;
-                            }
-                            this.sound_volume_spring.set_target(index as f32);
-                            this.save_settings(cx);
-                            if volume > 0.0 {
-                                crate::feedback::play(crate::feedback::Tone::DictationStart);
-                            }
-                        }))
-                }),
-            );
+        let sound_volume = sliding_segmented_control(sound_volume_position, &[34.0; 5]).children(
+            [
+                ("Off", 0.0_f32),
+                ("25%", 0.25),
+                ("50%", 0.5),
+                ("75%", 0.75),
+                ("100%", 1.0),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, volume))| {
+                let selected = if volume == 0.0 {
+                    !self.settings.sound_effects
+                } else {
+                    self.settings.sound_effects
+                        && (self.settings.sound_effect_volume - volume).abs() < 0.01
+                };
+                sliding_segmented_item(34.0, selected)
+                    .id(("sound-volume", index))
+                    .text_size(px(9.0))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.sound_effects = volume > 0.0;
+                        if volume > 0.0 {
+                            this.settings.sound_effect_volume = volume;
+                        }
+                        this.sound_volume_spring.set_target(index as f32);
+                        this.save_settings(cx);
+                        if volume > 0.0 {
+                            crate::feedback::play(crate::feedback::Tone::DictationStart);
+                        }
+                    }))
+            }),
+        );
         let launch_at_login_control =
             if self.launch_at_login_status == LoginItemStatus::RequiresApproval {
                 compact_button("Open Settings")
@@ -3463,19 +3400,7 @@ impl AppWindow {
             };
         let recording_audio_position = self.recording_audio_spring.render_position(window);
         let audio_widths = [50.0, 90.0, 80.0];
-        let (audio_left, audio_width) = segmented_geometry(recording_audio_position, audio_widths);
-        let audio_behavior = segmented_control()
-            .relative()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(audio_left))
-                    .top(px(2.0))
-                    .w(px(audio_width))
-                    .h(px(26.0))
-                    .rounded(px(4.0))
-                    .bg(rgb(SURFACE_SELECTED)),
-            )
+        let audio_behavior = sliding_segmented_control(recording_audio_position, &audio_widths)
             .children(
                 [
                     RecordingAudioBehavior::ALL[1],
@@ -3486,12 +3411,8 @@ impl AppWindow {
                 .enumerate()
                 .map(|(index, behavior)| {
                     let selected = self.settings.recording_audio_behavior == behavior;
-                    segmented_item(selected)
+                    sliding_segmented_item(audio_widths[index], selected)
                         .id(("recording-audio-behavior", index))
-                        .w(px(audio_widths[index]))
-                        .px(px(0.0))
-                        .justify_center()
-                        .bg(rgba(0x00000000))
                         .child(behavior.label())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.settings.recording_audio_behavior == behavior {
@@ -3503,49 +3424,37 @@ impl AppWindow {
                         }))
                 }),
             );
-        let microphone_mode = segmented_control()
+        let microphone_mode = sliding_segmented_control(release_microphone_position, &[114.0; 2])
             .id("microphone-mode")
-            .relative()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(2.0 + release_microphone_position * 114.0))
-                    .top(px(2.0))
-                    .w(px(114.0))
-                    .h(px(26.0))
-                    .rounded(px(4.0))
-                    .bg(rgb(SURFACE_SELECTED)),
-            )
             .children(
                 [("Keep ready (fast)", false), ("Release when idle", true)]
                     .into_iter()
                     .enumerate()
                     .map(|(index, (label, release))| {
-                        segmented_item(self.settings.release_microphone_while_idle == release)
-                            .id(("microphone-mode", index))
-                            .w(px(114.0))
-                            .px(px(0.0))
-                            .justify_center()
-                            .bg(rgba(0x00000000))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if release && !this.settings.release_microphone_while_idle {
-                                    this.pending_microphone_policy =
-                                        Some(MicrophonePolicyChange::DisableCommandsAndRelease);
-                                    cx.notify();
-                                    return;
-                                }
-                                this.pending_microphone_policy = None;
-                                if this.settings.release_microphone_while_idle != release
-                                    && let Err(error) = this.update_microphone_policy(
-                                        MicrophonePolicyChange::SetReleaseWhileIdle(release),
-                                        cx,
-                                    )
-                                {
-                                    tracing::error!(%error, "could not update microphone policy");
-                                }
+                        sliding_segmented_item(
+                            114.0,
+                            self.settings.release_microphone_while_idle == release,
+                        )
+                        .id(("microphone-mode", index))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if release && !this.settings.release_microphone_while_idle {
+                                this.pending_microphone_policy =
+                                    Some(MicrophonePolicyChange::DisableCommandsAndRelease);
                                 cx.notify();
-                            }))
+                                return;
+                            }
+                            this.pending_microphone_policy = None;
+                            if this.settings.release_microphone_while_idle != release
+                                && let Err(error) = this.update_microphone_policy(
+                                    MicrophonePolicyChange::SetReleaseWhileIdle(release),
+                                    cx,
+                                )
+                            {
+                                tracing::error!(%error, "could not update microphone policy");
+                            }
+                            cx.notify();
+                        }))
                     }),
             );
         let microphone_confirmation = (self.pending_microphone_policy
@@ -3666,33 +3575,15 @@ impl AppWindow {
                                         )
                                         .id("recording-audio-setting"),
                                     )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .min_h(px(72.0))
-                                            .px_4()
-                                            .py_3()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap_4()
-                                            .border_b_1()
-                                            .border_color(rgb(LINE))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .child(settings_copy(
-                                                        "Microphone mode",
-                                                        if self.settings.release_microphone_while_idle {
-                                                            "Opens on the shortcut, with a start-up delay and no pre-roll. Commands are off."
-                                                        } else {
-                                                            "Default: keeps the microphone open for the fastest start. A short pre-roll helps catch the beginning of speech. Audio is not saved by default."
-                                                        },
-                                                    )),
-                                            )
-                                            .child(microphone_mode),
-                                    )
+                                    .child(settings_row(
+                                        "Microphone mode",
+                                        if self.settings.release_microphone_while_idle {
+                                            "Opens on the shortcut, with a start-up delay and no pre-roll. Commands are off."
+                                        } else {
+                                            "Default: keeps the microphone open for the fastest start. A short pre-roll helps catch the beginning of speech. Audio is not saved by default."
+                                        },
+                                        microphone_mode,
+                                    ))
                                     .children(microphone_confirmation)
                                     .child(
                                         settings_row(
@@ -3703,7 +3594,7 @@ impl AppWindow {
                                         .border_b_0()
                                         .id("double-tap-setting")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            let enabled = !this.snapshot().double_tap_lock;
+                                            let enabled = !this.settings.double_tap_lock;
                                             if let Err(error) = this.dispatch(
                                                 DesktopAction::SetDoubleTapLock(enabled),
                                             ) {
@@ -3725,7 +3616,7 @@ impl AppWindow {
                                                 )
                                                 .id("double-tap-only-setting")
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    let enabled = !this.snapshot().double_tap_only;
+                                                    let enabled = !this.settings.double_tap_only;
                                                     if let Err(error) = this.dispatch(
                                                         DesktopAction::SetDoubleTapOnly(enabled),
                                                     ) {
@@ -4181,12 +4072,17 @@ impl AppWindow {
     }
 
     fn persist_settings(&mut self) -> color_eyre::Result<()> {
-        self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
-        if self.preview {
-            self.settings_dirty = false;
-            return Ok(());
+        self.commit_settings(self.settings.clone())
+    }
+
+    /// Saves before assigning so a failed save leaves the live settings
+    /// untouched; the generation bump supersedes any pending debounced save.
+    fn commit_settings(&mut self, candidate: AppSettings) -> color_eyre::Result<()> {
+        if !self.preview {
+            candidate.save()?;
         }
-        self.settings.save()?;
+        self.settings = candidate;
+        self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
         self.settings_dirty = false;
         self.settings_load_error = None;
         Ok(())
@@ -4236,8 +4132,9 @@ impl AppWindow {
     }
 
     fn voice_action_inputs(settings: &AppSettings, cx: &mut Context<Self>) -> VoiceActionInputs {
-        let model = Self::voice_action_model_input(
+        let model = Self::model_input(
             settings.voice_action.model.as_deref().unwrap_or_default(),
+            |_| ModelPickerTarget::VoiceAction,
             cx,
         );
         VoiceActionInputs {
@@ -4260,60 +4157,34 @@ impl AppWindow {
         }
     }
 
-    fn model_input(initial: &str, cx: &mut Context<Self>) -> ProcessingInput {
+    /// `target` is resolved at event time so the Mode picker follows the
+    /// currently selected mode rather than the one selected at construction.
+    fn model_input(
+        initial: &str,
+        target: fn(&Self) -> ModelPickerTarget,
+        cx: &mut Context<Self>,
+    ) -> ProcessingInput {
         let entity = cx.new(|cx| TextInput::picker(cx, "Search available models", initial));
         let changed = cx.subscribe(&entity, |this, _, _: &TextChanged, cx| {
             this.model_picker_highlight = 0;
             cx.notify();
         });
-        let navigate = cx.subscribe(&entity, |this, _, event: &TextNavigate, cx| {
-            let count = this
-                .model_choice_keys(ModelPickerTarget::Mode(this.selected_mode), cx)
-                .len();
+        let navigate = cx.subscribe(&entity, move |this, _, event: &TextNavigate, cx| {
+            let count = this.model_choice_keys(target(this), cx).len();
             if count > 0 {
                 this.model_picker_highlight =
                     advance_highlight(this.model_picker_highlight, event.0, count);
                 cx.notify();
             }
         });
-        let submitted = cx.subscribe(&entity, |this, _, _: &TextSubmitted, cx| {
+        let submitted = cx.subscribe(&entity, move |this, _, _: &TextSubmitted, cx| {
+            let target = target(this);
             if let Some(model) = this
-                .model_choice_keys(ModelPickerTarget::Mode(this.selected_mode), cx)
+                .model_choice_keys(target, cx)
                 .get(this.model_picker_highlight)
                 .cloned()
             {
-                this.select_model(ModelPickerTarget::Mode(this.selected_mode), model, cx);
-            }
-        });
-        ProcessingInput {
-            entity,
-            _subscriptions: vec![changed, navigate, submitted],
-        }
-    }
-
-    fn voice_action_model_input(initial: &str, cx: &mut Context<Self>) -> ProcessingInput {
-        let entity = cx.new(|cx| TextInput::picker(cx, "Search available models", initial));
-        let changed = cx.subscribe(&entity, |this, _, _: &TextChanged, cx| {
-            this.model_picker_highlight = 0;
-            cx.notify();
-        });
-        let navigate = cx.subscribe(&entity, |this, _, event: &TextNavigate, cx| {
-            let count = this
-                .model_choice_keys(ModelPickerTarget::VoiceAction, cx)
-                .len();
-            if count > 0 {
-                this.model_picker_highlight =
-                    advance_highlight(this.model_picker_highlight, event.0, count);
-                cx.notify();
-            }
-        });
-        let submitted = cx.subscribe(&entity, |this, _, _: &TextSubmitted, cx| {
-            if let Some(model) = this
-                .model_choice_keys(ModelPickerTarget::VoiceAction, cx)
-                .get(this.model_picker_highlight)
-                .cloned()
-            {
-                this.select_model(ModelPickerTarget::VoiceAction, model, cx);
+                this.select_model(target, model, cx);
             }
         });
         ProcessingInput {
@@ -4389,7 +4260,11 @@ impl AppWindow {
                 &processing.prompt,
                 cx,
             ),
-            model: Self::model_input(processing.model.as_deref().unwrap_or_default(), cx),
+            model: Self::model_input(
+                processing.model.as_deref().unwrap_or_default(),
+                |this| ModelPickerTarget::Mode(this.selected_mode),
+                cx,
+            ),
             deadline: Self::processing_input("30", &processing.deadline_seconds.to_string(), cx),
             processing_toggle: ToggleSpring::new(processing.enabled),
             replacements: mode
@@ -6771,7 +6646,6 @@ impl AppWindow {
     }
 
     fn render_activity(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let snapshot = self.snapshot();
         let refresh = header_button("Refresh")
             .id("refresh-activity")
             .on_click(cx.listener(|this, _, _, cx| {
@@ -6783,11 +6657,11 @@ impl AppWindow {
             .flex()
             .items_center()
             .gap_4()
-            .when_some(snapshot.activity.state_label(), |actions, status| {
-                let active = snapshot.activity.state != Some(VoiceState::Stopping);
+            .when_some(self.activity.state_label(), |actions, status| {
+                let active = self.activity.state != Some(VoiceState::Stopping);
                 actions.child(listener_status(
                     status,
-                    snapshot.activity.device.clone().unwrap_or_default(),
+                    self.activity.device.clone().unwrap_or_default(),
                     active,
                 ))
             })
@@ -7435,13 +7309,7 @@ impl DesktopHost for AppWindow {
                 }
                 let mut candidate = self.settings.clone();
                 candidate.dictation_hotkey = binding;
-                if !self.preview {
-                    candidate.save()?;
-                }
-                self.settings = candidate;
-                self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
-                self.settings_dirty = false;
-                self.settings_load_error = None;
+                self.commit_settings(candidate)?;
             }
             DesktopAction::SetDoubleTapLock(enabled) => {
                 let mut candidate = self.settings.clone();
@@ -7449,13 +7317,7 @@ impl DesktopHost for AppWindow {
                 if !enabled {
                     candidate.double_tap_only = false;
                 }
-                if !self.preview {
-                    candidate.save()?;
-                }
-                self.settings = candidate;
-                self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
-                self.settings_dirty = false;
-                self.settings_load_error = None;
+                self.commit_settings(candidate)?;
                 self.double_tap_toggle.set_enabled(enabled);
             }
             DesktopAction::SetDoubleTapOnly(enabled) => {
@@ -7463,13 +7325,7 @@ impl DesktopHost for AppWindow {
                 candidate.double_tap_only = enabled
                     && candidate.double_tap_lock
                     && candidate.dictation_hotkey.key.is_some();
-                if !self.preview {
-                    candidate.save()?;
-                }
-                self.settings = candidate;
-                self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
-                self.settings_dirty = false;
-                self.settings_load_error = None;
+                self.commit_settings(candidate)?;
             }
         }
         Ok(())
@@ -7785,17 +7641,20 @@ fn hotkey_binding_conflicts(
     crate::app_settings::hotkey_conflicts(binding, others)
 }
 
+fn hotkey_binding(settings: &AppSettings, kind: HotkeyKind) -> Option<&HotkeyBinding> {
+    match kind {
+        HotkeyKind::Dictation => Some(&settings.dictation_hotkey),
+        HotkeyKind::Edit => Some(&settings.edit_hotkey),
+        HotkeyKind::PasteLast => settings.paste_last_hotkey.as_ref(),
+    }
+}
+
 fn hotkey_side_binding(
     settings: &AppSettings,
     kind: HotkeyKind,
     side: ModifierSide,
 ) -> Option<HotkeyBinding> {
-    let mut binding = match kind {
-        HotkeyKind::Dictation => &settings.dictation_hotkey,
-        HotkeyKind::Edit => &settings.edit_hotkey,
-        HotkeyKind::PasteLast => settings.paste_last_hotkey.as_ref()?,
-    }
-    .clone();
+    let mut binding = hotkey_binding(settings, kind)?.clone();
     standalone_modifier_side(&binding)?;
     set_standalone_modifier_side(&mut binding, side);
     (!hotkey_binding_conflicts(settings, kind, &binding)).then_some(binding)
@@ -7835,18 +7694,6 @@ fn recording_audio_index(behavior: RecordingAudioBehavior) -> usize {
         RecordingAudioBehavior::PauseMedia => 1,
         RecordingAudioBehavior::DoNothing => 2,
     }
-}
-
-fn segmented_geometry(position: f32, widths: [f32; 3]) -> (f32, f32) {
-    let position = position.clamp(0.0, 2.0);
-    let lower = position.floor() as usize;
-    let upper = (lower + 1).min(2);
-    let progress = position - lower as f32;
-    let lefts = [2.0, 2.0 + widths[0], 2.0 + widths[0] + widths[1]];
-    (
-        lefts[lower] + (lefts[upper] - lefts[lower]) * progress,
-        widths[lower] + (widths[upper] - widths[lower]) * progress,
-    )
 }
 
 fn sound_volume_index(settings: &AppSettings) -> usize {

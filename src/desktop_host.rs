@@ -37,7 +37,7 @@ impl DesktopCapabilities {
     }
 
     #[cfg(any(target_os = "linux", test))]
-        pub(crate) const fn linux_x11() -> Self {
+    pub(crate) const fn linux_x11() -> Self {
         Self {
             activity: false,
             commands: false,
@@ -113,7 +113,10 @@ pub(crate) enum DesktopAction {
 }
 
 pub(crate) trait DesktopHost {
-        fn capabilities(&self) -> DesktopCapabilities;
+    fn capabilities(&self) -> DesktopCapabilities;
+    /// Only the contained Linux root reads the portable snapshot; the macOS
+    /// root reads its own settings and activity directly.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn snapshot(&self) -> DesktopSnapshot;
     fn dispatch(&mut self, action: DesktopAction) -> Result<()>;
 }
