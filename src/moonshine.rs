@@ -1,19 +1,17 @@
 use std::ffi::{CStr, CString, c_char, c_float, c_int, c_uint, c_ulonglong, c_void};
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::UNIX_EPOCH;
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use fs2::FileExt;
 use libloading::Library;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::events::TranscriptPhase;
+use crate::transcription_models::{modified_ns, sha256_hex, write_json_atomically};
 
 const HEADER_VERSION: c_int = 20_000;
 const SMALL_STREAMING: c_uint = 4;
@@ -198,17 +196,6 @@ fn verification_receipt_path(model: &Path) -> PathBuf {
     model.join(".verified.json")
 }
 
-fn modified_ns(metadata: &fs::Metadata) -> Option<u64> {
-    metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos()
-        .try_into()
-        .ok()
-}
-
 fn verification_receipt_matches(model: &Path) -> bool {
     let Ok(bytes) = fs::read(verification_receipt_path(model)) else {
         return false;
@@ -249,16 +236,10 @@ fn write_verification_receipt(model: &Path) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let destination = verification_receipt_path(model);
-    let temporary = destination.with_extension("json.tmp");
-    fs::write(
-        &temporary,
-        serde_json::to_vec(&VerificationReceipt { files })?,
-    )?;
-    File::open(&temporary)?.sync_all()?;
-    fs::rename(temporary, destination)?;
-    File::open(model)?.sync_all()?;
-    Ok(())
+    write_json_atomically(
+        &verification_receipt_path(model),
+        &VerificationReceipt { files },
+    )
 }
 
 fn model_path() -> Result<PathBuf> {
@@ -271,22 +252,7 @@ fn verify_component(path: &Path, component: &ModelComponent) -> Result<()> {
     if fs::metadata(path)?.len() != component.bytes {
         return Err(eyre!("invalid byte length for {}", component.filename));
     }
-    let mut file = File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    let actual = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if actual != component.sha256 {
+    if sha256_hex(path, None)? != component.sha256 {
         return Err(eyre!("checksum mismatch for {}", component.filename));
     }
     Ok(())
@@ -451,7 +417,7 @@ impl Moonshine {
                     "incompatible Moonshine API version: expected {HEADER_VERSION}, loaded {version}"
                 ));
             }
-            let _native = write_native();
+            let native = write_native();
             let path = CString::new(model_path.to_string_lossy().as_bytes())?;
             let option_values = vec![
                 (
@@ -489,45 +455,37 @@ impl Moonshine {
                 HEADER_VERSION,
             );
             check_handle(&functions, transcriber, "load transcriber")?;
-            let mut streams = Vec::with_capacity(stream_count);
-            for _ in 0..stream_count {
-                let stream = (functions.create_stream)(transcriber, 0);
-                if let Err(error) = check_handle(&functions, stream, "create stream") {
-                    free_streams(
-                        &functions,
-                        transcriber,
-                        &streams,
-                        &vec![true; streams.len()],
-                    );
-                    (functions.free_transcriber)(transcriber);
-                    return Err(error);
-                }
-                if let Err(error) = check(
-                    &functions,
-                    (functions.start_stream)(transcriber, stream),
-                    "start stream",
-                ) {
-                    (functions.free_stream)(transcriber, stream);
-                    free_streams(
-                        &functions,
-                        transcriber,
-                        &streams,
-                        &vec![true; streams.len()],
-                    );
-                    (functions.free_transcriber)(transcriber);
-                    return Err(error);
-                }
-                streams.push(stream);
-            }
-
-            Ok(Self {
+            // From here on Drop owns cleanup, and Drop takes the native write
+            // lock itself, so this guard must be released before any `?`.
+            let mut moonshine = Self {
                 functions,
                 transcriber,
-                stream_active: vec![true; streams.len()],
-                streams,
+                streams: Vec::with_capacity(stream_count),
+                stream_active: Vec::with_capacity(stream_count),
                 _library: library,
-            })
+            };
+            let opened = (0..stream_count).try_for_each(|_| moonshine.open_stream());
+            drop(native);
+            opened?;
+            Ok(moonshine)
         }
+    }
+
+    /// Create and start one more stream while the caller holds the native
+    /// lock. A stream that fails to start stays registered as inactive so
+    /// Drop frees it without stopping it.
+    unsafe fn open_stream(&mut self) -> Result<()> {
+        let stream = unsafe { (self.functions.create_stream)(self.transcriber, 0) };
+        check_handle(&self.functions, stream, "create stream")?;
+        self.streams.push(stream);
+        self.stream_active.push(false);
+        let started = unsafe { (self.functions.start_stream)(self.transcriber, stream) };
+        check(&self.functions, started, "start stream")?;
+        *self
+            .stream_active
+            .last_mut()
+            .expect("stream was just registered") = true;
+        Ok(())
     }
 
     pub fn add_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<()> {
@@ -806,7 +764,7 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::sync::{Arc, Barrier};
-    use std::time::SystemTime;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn native_structs_match_the_moonshine_lp64_abi() {
