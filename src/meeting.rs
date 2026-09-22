@@ -756,13 +756,7 @@ fn transcribe(
     for entry in &transcript {
         serde_json::to_writer(&mut ndjson, entry)?;
         ndjson.write_all(b"\n")?;
-        writeln!(
-            markdown,
-            "**{} {}**  {}",
-            format_duration(entry.start_ms),
-            entry.source.label(),
-            entry.text
-        )?;
+        writeln!(markdown, "{}", markdown_line(entry))?;
     }
     ndjson.flush()?;
     markdown.flush()?;
@@ -934,19 +928,25 @@ pub fn show(id: &str) -> Result<String> {
     let manifest = read_manifest(&directory)?;
     let mut markdown = format!("# {}\n\n", manifest.title);
     for entry in transcript_entries_in(&directory)? {
-        markdown.push_str(&format!(
-            "**{} {}**  {}\n",
-            format_duration(entry.start_ms),
-            entry.source.label(),
-            entry.text
-        ));
+        markdown.push_str(&markdown_line(&entry));
+        markdown.push('\n');
     }
     Ok(markdown)
 }
 
+fn markdown_line(entry: &TranscriptEntry) -> String {
+    format!(
+        "**{} {}**  {}",
+        format_duration(entry.start_ms),
+        entry.source.label(),
+        entry.text
+    )
+}
+
+/// Callers recover the final publication first; `show` does so before its
+/// `final_transcript_exists` check.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn transcript_entries_in(directory: &Path) -> Result<Vec<TranscriptEntry>> {
-    recover_final_publication(directory)?;
     let final_path = directory.join("transcript.ndjson");
     if final_transcript_exists(directory) {
         return read_ndjson(&final_path);
@@ -1068,18 +1068,12 @@ pub fn format_duration(milliseconds: u64) -> String {
     format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
-#[cfg(unix)]
 fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(
         path,
         fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
     )?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_only(_path: &Path, _directory: bool) -> Result<()> {
     Ok(())
 }
 
