@@ -188,6 +188,20 @@ struct VoiceCapture {
     stability: ControlStability,
 }
 
+/// Where the current Moonshine stream's audio began. Every owner-side
+/// generation advance makes it stale; readers filter instead of clearing.
+#[derive(Clone, Copy)]
+struct RecognitionOrigin {
+    generation: u64,
+    at: CaptureInstant,
+}
+
+impl RecognitionOrigin {
+    fn for_generation(&self, generation: u64) -> Option<CaptureInstant> {
+        (self.generation == generation).then_some(self.at)
+    }
+}
+
 /// The dictation shortcut machine plus the optional Voice Action machine.
 /// `edit` stays `None` until Voice Action is enabled so no shortcut is reserved.
 struct Hotkeys {
@@ -301,7 +315,7 @@ pub fn listen(
     let mut voice: Option<VoiceCapture> = None;
     let mut activation_stability = ActivationStability::default();
     let mut last_update = Instant::now();
-    let mut recognition_origin = None::<(u64, CaptureInstant)>;
+    let mut recognition_origin = None::<RecognitionOrigin>;
     let recording_environment = RecordingEnvironmentController::start();
     let (mut microphone_revision, microphone) = crate::app_settings::microphone_selection();
     let input = DictationAudio::open(
@@ -725,7 +739,6 @@ pub fn listen(
                 Ok(Ok(loaded)) if commands_enabled => {
                     recognizer = Some(loaded);
                     input.invalidate_recognition()?;
-                    recognition_origin = None;
                     action_executor = Some(ActionExecutor::start());
                     command_loader = None;
                     set_command_model_status(CommandModelStatus::Ready);
@@ -1144,7 +1157,6 @@ pub fn listen(
                     );
                     input.discard_recognition_backlog();
                     reset_recognizer(&mut recognizer)?;
-                    recognition_origin = None;
                 }
                 DictationAudioEvent::CaptureDiscontinuity {
                     was_recording,
@@ -1153,7 +1165,6 @@ pub fn listen(
                 } => {
                     input.discard_recognition_backlog();
                     reset_recognizer(&mut recognizer)?;
-                    recognition_origin = None;
                     if was_recording {
                         programmatic = None;
                         hotkeys.suspend_all();
@@ -1182,7 +1193,6 @@ pub fn listen(
                 DictationAudioEvent::Reopened => {
                     input.discard_recognition_backlog();
                     reset_recognizer(&mut recognizer)?;
-                    recognition_origin = None;
                     if !input.is_recording() {
                         emit_state(&mut events, false, mode, &input.device_name())?;
                     }
@@ -1197,7 +1207,6 @@ pub fn listen(
                     hotkeys.suspend_all();
                     input.discard_recognition_backlog();
                     reset_recognizer(&mut recognizer)?;
-                    recognition_origin = None;
                     if was_recording {
                         feedback::play(Tone::Error);
                         events.dictation(
@@ -1243,8 +1252,14 @@ pub fn listen(
             && !hotkeys.suppresses_recognition()
         {
             let generation = input.recognition_generation();
-            if recognition_origin.is_none_or(|(current, _)| current != generation) {
-                recognition_origin = Some((generation, audio.captured_from()));
+            if recognition_origin
+                .and_then(|origin| origin.for_generation(generation))
+                .is_none()
+            {
+                recognition_origin = Some(RecognitionOrigin {
+                    generation,
+                    at: audio.captured_from(),
+                });
             }
         }
         let mut fed_generation = None;
@@ -1277,7 +1292,6 @@ pub fn listen(
         if fed_generation.is_some_and(|generation| generation != input.recognition_generation()) {
             input.discard_recognition_backlog();
             reset_recognizer(&mut recognizer)?;
-            recognition_origin = None;
             continue;
         }
         if !input.is_recovering()
@@ -1289,11 +1303,11 @@ pub fn listen(
         {
             let generation = input.recognition_generation();
             if recognition_origin
-                .is_none_or(|(origin_generation, _)| origin_generation != generation)
+                .and_then(|origin| origin.for_generation(generation))
+                .is_none()
             {
                 input.discard_recognition_backlog();
                 recognizer.reset_stream()?;
-                recognition_origin = None;
                 last_update = Instant::now();
                 continue;
             }
@@ -1301,7 +1315,6 @@ pub fn listen(
             if generation != input.recognition_generation() {
                 input.discard_recognition_backlog();
                 recognizer.reset_stream()?;
-                recognition_origin = None;
                 last_update = Instant::now();
                 continue;
             }
@@ -1309,7 +1322,6 @@ pub fn listen(
                 if generation != input.recognition_generation() {
                     input.discard_recognition_backlog();
                     recognizer.reset_stream()?;
-                    recognition_origin = None;
                     break;
                 }
                 let active_runtime = personal_commands
@@ -1376,7 +1388,6 @@ pub fn listen(
                             input.captured_through(),
                         );
                         let active = voice.take().expect("voice capture is active");
-                        recognition_origin = None;
                         recognizer.reset_stream()?;
                         handle_voice_dictation_control(
                             control,
@@ -2097,14 +2108,14 @@ fn handle_voice_dictation_control(
 }
 
 fn recognition_boundary(
-    origin: Option<(u64, CaptureInstant)>,
+    origin: Option<RecognitionOrigin>,
     generation: u64,
     stream_ms: u64,
     fallback: CaptureInstant,
 ) -> CaptureInstant {
     origin
-        .filter(|(origin_generation, _)| *origin_generation == generation)
-        .and_then(|(_, origin)| origin.checked_add(Duration::from_millis(stream_ms)))
+        .and_then(|origin| origin.for_generation(generation))
+        .and_then(|origin| origin.checked_add(Duration::from_millis(stream_ms)))
         .unwrap_or(fallback)
 }
 
@@ -2323,6 +2334,20 @@ mod tests {
         }
         assert_eq!(completions.len(), PROGRAMMATIC_COMPLETION_LIMIT);
         assert_eq!(completions.front().map(|completion| completion.id), Some(2));
+    }
+
+    #[test]
+    fn recognition_boundary_ignores_an_origin_from_a_stale_generation() {
+        let at = CaptureInstant::from_nanos(60_000_000_000);
+        let fallback = CaptureInstant::from_nanos(90_000_000_000);
+        let origin = Some(RecognitionOrigin { generation: 3, at });
+
+        assert_eq!(
+            recognition_boundary(origin, 3, 250, fallback),
+            at + Duration::from_millis(250)
+        );
+        assert_eq!(recognition_boundary(origin, 4, 250, fallback), fallback);
+        assert_eq!(recognition_boundary(None, 3, 250, fallback), fallback);
     }
 
     #[test]
