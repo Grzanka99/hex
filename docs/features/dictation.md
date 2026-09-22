@@ -215,9 +215,12 @@ no foreground application consumes the clipboard.
 Record -> Release -> Transcribing/processing/paste -> Finished // dictate.feedback
   HUD + tones distinguish capture from pending work          // never take focus
   Pending processing/paste -> Still unfinished, not recording
+  Tone requested -> Playback worker opens the default output, then plays
+     -> Output stays open 30 s past the last tone, then releases
+     -> Released output holds no macOS idle-sleep assertion
   Feedback volume = 0 -> No tones
      -> Playback worker releases output on its next 250 ms observation
-     -> Volume enabled again -> Reopen on playback worker, never capture/UI
+     -> Volume enabled again -> Reopen for the next tone, never capture/UI
   Cold audio stack exceeds preload admission -> Warn once; recognition continues
      -> Loader keeps running; later tones play once the output opens
 ```
@@ -229,13 +232,33 @@ the player when the default output finally opens, restoring tones for the rest
 of the session. Linux already logged and continued; the macOS worker now
 matches that behavior instead of stopping desktop recognition.
 
-The playback worker skips output initialization when sounds are Off. A live
-volume change to Off drops the output stream; a device open already in progress
-must return before the worker can observe that change. Output-open failures
-retry at most once per two seconds. Bundled samples remain decoded in memory.
-`sound_off_releases_output_and_reenable_reopens_it` checks actual ownership/drop
-with a controlled sink; `failed_output_initialization_retries_with_a_bounded_backoff`
-checks failure-to-success recovery without an audio device.
+The playback worker never opens the output at startup. It opens the default
+output for the first tone, keeps it through a thirty-second idle grace so one
+dictation's start and stop tones share a warm device, and releases it after
+that grace or on the next observation after sounds turn Off. A device open
+already in progress must return before the worker can observe that change.
+Output-open failures retry at most once per two seconds, and a released device
+reopens without that backoff. Bundled samples remain decoded in memory. A
+tone that arrives after the grace pays a cold device open first; the tone is
+delayed, not clipped or dropped. Overlapping tones extend the playing window
+rather than shortening it.
+
+**Fixed after 2.1.20:** through 2.1.20 the worker opened the output at startup
+and kept it open for as long as sounds were On, so `coreaudiod` held a
+`PreventUserIdleSystemSleep` assertion for HEX's PID and an idle Mac never
+slept ([#95](https://github.com/anomalyco/hex/issues/95)). 2.1.18 released the
+stream only when sounds were Off. Startup admission therefore no longer
+reports `could not open the audio output`; a device failure surfaces as a
+warning when the first tone plays.
+`output_opens_for_a_tone_and_releases_after_the_idle_grace` and
+`overlapping_tones_extend_playback_instead_of_truncating_it` check ownership,
+grace, and drop with a controlled sink;
+`failed_output_initialization_retries_with_a_bounded_backoff` checks
+failure-to-success recovery without an audio device. The opt-in
+`native_output_release_clears_the_idle_sleep_assertion` opens the real default
+output and reads `pmset -g assertions`; on September 22, 2026 it observed the
+assertion appear for the test PID and clear within a second of release on the
+built-in speakers. That is not an installed-app or USB/Bluetooth measurement.
 `timed_out_admission_still_publishes_a_usable_player` checks the production
 publication path after the admission receiver has gone away. These checks do
 not measure the reporter's CoreAudio CPU usage or establish audible playback.

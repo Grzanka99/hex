@@ -681,8 +681,10 @@ Capture                                  // hex app and hex dictate
 
 The shared [feedback player](../../src/feedback.rs) uses the bundled recording
 sounds on both platforms; only macOS wake/sleep/error tones use `afplay`.
-Decoding and output initialization happen before the Linux capture loop, and
-playback admission is bounded and nonblocking. Output preparation failures are
+Decoding happens before the Linux capture loop; the output device opens for
+the first tone and is released thirty seconds after the last one, as described
+in [macOS feedback](dictation.md#feedback). Playback admission is bounded and
+nonblocking. Output preparation failures are
 logged without blocking dictation. Sound-volume saves in
 [linux_app.rs](../../src/linux_app.rs) preserve listener ownership; failed saves
 leave the previous selection active, and shortcut/model edits temporarily disable
