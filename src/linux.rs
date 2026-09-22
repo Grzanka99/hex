@@ -92,7 +92,7 @@ pub fn run(shutdown: &'static AtomicBool) -> Result<()> {
         .command
         .unwrap_or(Command::App { hidden: false })
     {
-        Command::App { hidden } => crate::linux_app::open(event_path, hidden, shutdown),
+        Command::App { hidden } => crate::linux_app::open(hidden, shutdown),
         Command::Service => crate::linux_app::run_service(event_path, shutdown),
         Command::Start => crate::linux_service::start(),
         Command::Stop => crate::linux_service::stop(),
@@ -103,7 +103,7 @@ pub fn run(shutdown: &'static AtomicBool) -> Result<()> {
         }
         Command::Dictate { device } => {
             let _instance = crate::instance::acquire("listener")?;
-            crate::linux_dictation::run(&event_path, device.as_deref(), shutdown)
+            crate::linux_dictation::run(&event_path, device.as_deref(), shutdown, None)
         }
         Command::Devices => {
             for device in crate::audio::input_device_names()? {
