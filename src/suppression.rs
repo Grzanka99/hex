@@ -626,7 +626,11 @@ pub enum HotkeyAction {
 
 #[derive(Debug)]
 enum State {
-    Idle,
+    Idle {
+        // The last Recording release, kept only while double-tap lock may
+        // still pair the next press with it.
+        last_release_at: Option<CaptureInstant>,
+    },
     FirstTapPressed,
     AwaitingSecondTap {
         released_at: CaptureInstant,
@@ -642,12 +646,25 @@ enum State {
     Dirty,
 }
 
+impl State {
+    const IDLE: Self = Self::Idle {
+        last_release_at: None,
+    };
+
+    /// A double-tap-only gesture that has not yet locked.
+    fn is_pending_gesture(&self) -> bool {
+        matches!(
+            self,
+            Self::FirstTapPressed | Self::AwaitingSecondTap { .. } | Self::SecondTapPressed { .. }
+        )
+    }
+}
+
 pub struct DictationHotkey {
     state: State,
     pressed_keys: HashSet<u16>,
     double_tap_enabled: bool,
     double_tap_only: bool,
-    last_release_at: Option<CaptureInstant>,
     binding: RuntimeHotkey,
     paste_actions_enabled: bool,
     ignore_before: Option<CaptureInstant>,
@@ -689,12 +706,11 @@ impl DictationHotkey {
                     previous_release: None,
                 }
             } else {
-                State::Idle
+                State::IDLE
             },
             pressed_keys: HashSet::new(),
             double_tap_enabled,
             double_tap_only: false,
-            last_release_at: None,
             binding,
             paste_actions_enabled: true,
             ignore_before: None,
@@ -710,18 +726,18 @@ impl DictationHotkey {
     }
 
     pub fn suppresses_recognition(&self) -> bool {
-        !matches!(self.state, State::Idle)
+        !matches!(self.state, State::Idle { .. })
     }
 
     pub fn set_double_tap_enabled(&mut self, enabled: bool) {
         self.double_tap_enabled = enabled;
         if !enabled {
-            self.last_release_at = None;
-            if let State::Recording {
-                previous_release, ..
-            } = &mut self.state
-            {
-                *previous_release = None;
+            match &mut self.state {
+                State::Idle { last_release_at } => *last_release_at = None,
+                State::Recording {
+                    previous_release, ..
+                } => *previous_release = None,
+                _ => {}
             }
         }
     }
@@ -730,46 +746,34 @@ impl DictationHotkey {
         self.double_tap_only =
             enabled && self.binding.key_code.is_some() && self.double_tap_enabled;
         // Active captures still need their release or Escape to reach the audio owner.
-        if !self.double_tap_only
-            && matches!(
-                self.state,
-                State::FirstTapPressed
-                    | State::AwaitingSecondTap { .. }
-                    | State::SecondTapPressed { .. }
-            )
-        {
-            self.state = State::Idle;
+        if !self.double_tap_only && self.state.is_pending_gesture() {
+            self.state = State::IDLE;
         }
     }
 
     pub fn set_binding(&mut self, binding: RuntimeHotkey) {
-        if matches!(self.state, State::Idle) && self.binding != binding {
+        if let State::Idle { last_release_at } = &mut self.state
+            && self.binding != binding
+        {
             self.binding = binding;
-            self.last_release_at = None;
+            *last_release_at = None;
         }
     }
 
     pub fn suspend(&mut self) -> Option<HotkeyAction> {
         let was_recording = self.is_recording();
         self.function_modifier = (CaptureInstant::now(), None);
-        self.state = State::Idle;
+        self.state = State::IDLE;
         self.pressed_keys.clear();
-        self.last_release_at = None;
         self.stale_keys_neutral_since = None;
         was_recording.then_some(HotkeyAction::Cancel)
     }
 
     pub fn disarm_pending_gesture(&mut self) {
         if !self.is_recording() {
-            if matches!(
-                self.state,
-                State::FirstTapPressed
-                    | State::AwaitingSecondTap { .. }
-                    | State::SecondTapPressed { .. }
-            ) {
-                self.state = State::Idle;
+            if matches!(self.state, State::Idle { .. }) || self.state.is_pending_gesture() {
+                self.state = State::IDLE;
             }
-            self.last_release_at = None;
             self.stale_keys_neutral_since = None;
         }
     }
@@ -788,7 +792,6 @@ impl DictationHotkey {
 
     pub fn suppress_until_release(&mut self) {
         self.state = State::Dirty;
-        self.last_release_at = None;
         self.stale_keys_neutral_since = None;
     }
 
@@ -808,8 +811,8 @@ impl DictationHotkey {
         mut flags: impl FnMut() -> u64,
         mut key_down: impl FnMut(u16) -> bool,
     ) {
-        if !matches!(self.state, State::Idle | State::Dirty)
-            || (matches!(self.state, State::Idle) && self.pressed_keys.is_empty())
+        if !matches!(self.state, State::Idle { .. } | State::Dirty)
+            || (matches!(self.state, State::Idle { .. }) && self.pressed_keys.is_empty())
         {
             self.stale_keys_neutral_since = None;
             return;
@@ -845,8 +848,7 @@ impl DictationHotkey {
             "resynchronized stale input tracking after neutral keyboard"
         );
         self.pressed_keys.clear();
-        self.last_release_at = None;
-        self.state = State::Idle;
+        self.state = State::IDLE;
         self.stale_keys_neutral_since = None;
         self.recovery_ignore_through = Some(sampled_through);
         self.recovery_updated_keys.clear();
@@ -906,7 +908,6 @@ impl DictationHotkey {
             let was_recording = self.is_recording();
             self.function_modifier = (CaptureInstant::now(), None);
             self.state = State::Dirty;
-            self.last_release_at = None;
             return was_recording.then_some(HotkeyAction::Cancel);
         }
         // Queued edges from before an opt-in transition cannot start a new capture.
@@ -930,7 +931,7 @@ impl DictationHotkey {
                 InputEvent::Flags(flags) | InputEvent::Key { flags, .. }
                     if flags & HOTKEY_MODIFIERS_MASK == 0 && self.pressed_keys.is_empty()
             );
-            if !neutral && matches!(self.state, State::Idle | State::Dirty) {
+            if !neutral && matches!(self.state, State::Idle { .. } | State::Dirty) {
                 self.state = State::Dirty;
             }
             return None;
@@ -941,7 +942,6 @@ impl DictationHotkey {
             && let Some(action) = paste_action(event, crate::app_settings::runtime_hotkeys())
         {
             self.state = State::Dirty;
-            self.last_release_at = None;
             return Some(action);
         }
         if matches!(
@@ -954,7 +954,6 @@ impl DictationHotkey {
         ) && self.is_recording()
         {
             self.state = State::Dirty;
-            self.last_release_at = None;
             return Some(HotkeyAction::Cancel);
         }
 
@@ -984,7 +983,7 @@ impl DictationHotkey {
         });
 
         match self.state {
-            State::Idle if self.double_tap_only && trigger_pressed => {
+            State::Idle { .. } if self.double_tap_only && trigger_pressed => {
                 self.state = State::FirstTapPressed;
                 None
             }
@@ -1008,7 +1007,7 @@ impl DictationHotkey {
                 Some(HotkeyAction::Start)
             }
             State::SecondTapPressed { .. } if trigger_released => {
-                self.state = State::Idle;
+                self.state = State::IDLE;
                 None
             }
             State::AwaitingSecondTap { .. }
@@ -1027,17 +1026,16 @@ impl DictationHotkey {
                 self.state = if trigger_pressed {
                     State::FirstTapPressed
                 } else {
-                    State::Idle
+                    State::IDLE
                 };
                 None
             }
             State::Locked if trigger_pressed => {
                 self.state = State::Dirty;
-                self.last_release_at = None;
                 Some(HotkeyAction::Finish)
             }
-            State::Idle if trigger_pressed => {
-                let previous_release = self.last_release_at.take().filter(|released| {
+            State::Idle { last_release_at } if trigger_pressed => {
+                let previous_release = last_release_at.filter(|released| {
                     self.double_tap_enabled && now.duration_since(*released) < DOUBLE_TAP_WINDOW
                 });
                 self.state = State::Recording {
@@ -1054,8 +1052,9 @@ impl DictationHotkey {
                 None
             }
             State::Recording { .. } if trigger_released => {
-                self.state = State::Idle;
-                self.last_release_at = self.double_tap_enabled.then_some(now);
+                self.state = State::Idle {
+                    last_release_at: self.double_tap_enabled.then_some(now),
+                };
                 Some(HotkeyAction::Finish)
             }
             State::Recording { started_at, .. }
@@ -1065,14 +1064,13 @@ impl DictationHotkey {
                         || extra_modifiers) =>
             {
                 self.state = State::Dirty;
-                self.last_release_at = None;
                 Some(HotkeyAction::Discard)
             }
             State::Dirty
                 if flags.is_some_and(|flags| flags & HOTKEY_MODIFIERS_MASK == 0)
                     && self.pressed_keys.is_empty() =>
             {
-                self.state = State::Idle;
+                self.state = State::IDLE;
                 None
             }
             _ => None,
@@ -1832,7 +1830,7 @@ mod tests {
                 || 0,
                 |_| false,
             );
-            assert!(matches!(hotkey.state, State::Idle));
+            assert!(matches!(hotkey.state, State::Idle { .. }));
             hotkey.suppress_until_release();
             // A later explicit modifier release allows the navigation metadata
             // to be ignored without changing ordinary key-event Fn matching.
@@ -1844,7 +1842,7 @@ mod tests {
                 || FUNCTION,
                 |_| false,
             );
-            assert!(matches!(hotkey.state, State::Idle));
+            assert!(matches!(hotkey.state, State::Idle { .. }));
         }
     }
 
@@ -1942,7 +1940,7 @@ mod tests {
                 || 0,
                 |_| false,
             );
-            assert!(matches!(hotkey.state, State::Idle));
+            assert!(matches!(hotkey.state, State::Idle { .. }));
         }
     }
 
