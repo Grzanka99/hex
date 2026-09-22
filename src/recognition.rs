@@ -1953,13 +1953,7 @@ fn handle_command(
                         TrySendError::Disconnected(_) => "meeting controller is unavailable",
                     })
                 });
-            match outcome {
-                Ok(()) => (Some(id.into()), CommandOutcome::Executed),
-                Err(error) => {
-                    feedback::play(Tone::Error);
-                    (Some(id.into()), CommandOutcome::Failed(error.into()))
-                }
-            }
+            submission_outcome(id, outcome, CommandOutcome::Executed)
         }
         Decision::Execute {
             id,
@@ -1974,23 +1968,13 @@ fn handle_command(
                 .and_then(|runtime| {
                     runtime.invoke(generation, id, heard, context.clone(), captures)
                 });
-            match outcome {
-                Ok(()) => (Some(id.into()), CommandOutcome::Submitted),
-                Err(error) => {
-                    feedback::play(Tone::Error);
-                    (Some(id.into()), CommandOutcome::Failed(error.into()))
-                }
-            }
+            submission_outcome(id, outcome, CommandOutcome::Submitted)
         }
-        Decision::Execute { id, action } => {
-            match action_executor.submit(id, action, heard, context.label()) {
-                Ok(()) => (Some(id.into()), CommandOutcome::Submitted),
-                Err(error) => {
-                    feedback::play(Tone::Error);
-                    (Some(id.into()), CommandOutcome::Failed(error.into()))
-                }
-            }
-        }
+        Decision::Execute { id, action } => submission_outcome(
+            id,
+            action_executor.submit(id, action, heard, context.label()),
+            CommandOutcome::Submitted,
+        ),
         Decision::ExecuteSequence { .. } => unreachable!(),
     };
     events.emit(&VoiceEvent::Command {
@@ -2001,6 +1985,23 @@ fn handle_command(
         context: context.label(),
     })?;
     Ok(())
+}
+
+/// The command event for a submission: `ok` on success, otherwise a failure
+/// outcome with the error tone.
+fn submission_outcome(
+    id: &str,
+    result: Result<(), &str>,
+    ok: CommandOutcome,
+) -> (Option<String>, CommandOutcome) {
+    let outcome = match result {
+        Ok(()) => ok,
+        Err(error) => {
+            feedback::play(Tone::Error);
+            CommandOutcome::Failed(error.into())
+        }
+    };
+    (Some(id.into()), outcome)
 }
 
 fn handle_action_outcome(outcome: ActionOutcome, events: &mut EventLog) -> Result<()> {
@@ -2325,6 +2326,7 @@ fn handle_dictation_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_settings::{COMMAND_KEY_MASK, OPTION_KEY_MASK};
 
     #[test]
     fn command_preparation_does_not_block_the_listener_or_propagate_failure() {
@@ -2464,21 +2466,21 @@ mod tests {
         use crate::app_settings::RuntimeHotkey;
         use crate::suppression::{DictationHotkey, InputEvent};
 
-        const OPTION: u64 = 1 << 19;
-        const COMMAND: u64 = 1 << 20;
         let now = CaptureInstant::from_nanos(60_000_000_000);
         let mut dictation = DictationHotkey::new(
             now,
             true,
             RuntimeHotkey {
-                modifiers: crate::app_settings::modifiers_from_flags(OPTION),
+                modifiers: crate::app_settings::modifiers_from_flags(OPTION_KEY_MASK),
                 key_code: None,
             },
         );
         let mut edit = DictationHotkey::new_without_paste(
             now,
             RuntimeHotkey {
-                modifiers: crate::app_settings::modifiers_from_flags(OPTION | COMMAND),
+                modifiers: crate::app_settings::modifiers_from_flags(
+                    OPTION_KEY_MASK | COMMAND_KEY_MASK,
+                ),
                 key_code: None,
             },
         );
@@ -2487,7 +2489,7 @@ mod tests {
         edit.suspend();
 
         // Option down: plain dictation starts, no Voice Action gesture yet.
-        let event = InputEvent::Flags(OPTION);
+        let event = InputEvent::Flags(OPTION_KEY_MASK);
         let edit_action = edit.process(event, now);
         let action = dictation.process(event, now).expect("dictation starts");
         assert_eq!(action, HotkeyAction::Start);
@@ -2501,7 +2503,7 @@ mod tests {
         // Command joins after the hold threshold: the dictation machine stays
         // silently recording while the edit machine starts the gesture.
         let chord_at = now + MINIMUM_HOLD_DURATION + Duration::from_millis(150);
-        let event = InputEvent::Flags(OPTION | COMMAND);
+        let event = InputEvent::Flags(OPTION_KEY_MASK | COMMAND_KEY_MASK);
         let edit_action = edit.process(event, chord_at);
         assert_eq!(edit_action, Some(HotkeyAction::Start));
         assert_eq!(dictation.process(event, chord_at), None);
@@ -2510,7 +2512,7 @@ mod tests {
         // The Voice Action gesture must own the dictation Finish, or plain
         // dictation would consume the capture out from under it.
         let release_at = chord_at + Duration::from_secs(1);
-        let event = InputEvent::Flags(COMMAND);
+        let event = InputEvent::Flags(COMMAND_KEY_MASK);
         let edit_action = edit.process(event, release_at);
         assert_eq!(edit_action, Some(HotkeyAction::Finish));
         let action = dictation
@@ -2527,7 +2529,7 @@ mod tests {
 
         // A later plain Option dictation is unaffected.
         let idle_at = release_at + Duration::from_secs(2);
-        let event = InputEvent::Flags(OPTION);
+        let event = InputEvent::Flags(OPTION_KEY_MASK);
         let edit_action = edit.process(event, idle_at);
         let action = dictation.process(event, idle_at).expect("dictation starts");
         assert_eq!(action, HotkeyAction::Start);
@@ -2545,34 +2547,34 @@ mod tests {
         use crate::dictation::DictationCapture;
         use crate::suppression::InputEvent;
 
-        const OPTION: u64 = 1 << 19;
-        const COMMAND: u64 = 1 << 20;
         let now = CaptureInstant::from_nanos(60_000_000_000);
         let mut hotkey = DictationHotkey::new(
             now,
             true,
             RuntimeHotkey {
-                modifiers: crate::app_settings::modifiers_from_flags(OPTION),
+                modifiers: crate::app_settings::modifiers_from_flags(OPTION_KEY_MASK),
                 key_code: None,
             },
         );
         let mut edit_hotkey = DictationHotkey::new_without_paste(
             now,
             RuntimeHotkey {
-                modifiers: crate::app_settings::modifiers_from_flags(OPTION | COMMAND),
+                modifiers: crate::app_settings::modifiers_from_flags(
+                    OPTION_KEY_MASK | COMMAND_KEY_MASK,
+                ),
                 key_code: None,
             },
         );
         hotkey.suspend();
         edit_hotkey.suspend();
         let mut capture = DictationCapture::new(16_000);
-        let option = InputEvent::Flags(OPTION);
+        let option = InputEvent::Flags(OPTION_KEY_MASK);
         assert_eq!(edit_hotkey.process(option, now), None);
         assert_eq!(hotkey.process(option, now), Some(HotkeyAction::Start));
         capture.start_at(now);
 
         let chord_at = now + Duration::from_millis(40);
-        let chord = InputEvent::Flags(OPTION | COMMAND);
+        let chord = InputEvent::Flags(OPTION_KEY_MASK | COMMAND_KEY_MASK);
         let edit_action = edit_hotkey.process(chord, chord_at);
         assert_eq!(edit_action, Some(HotkeyAction::Start));
         let mut pending = None;
