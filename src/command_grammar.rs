@@ -141,15 +141,26 @@ impl PatternToken {
     fn accepts_literal(&self, literal: &str) -> bool {
         match self {
             Self::Literal(expected) => expected == literal,
-            Self::Digit { min, max } => {
-                parse_digit(literal).is_some_and(|digit| digit >= *min && digit <= *max)
-            }
+            Self::Digit { .. } | Self::Letter | Self::Choice(_) => self.capture(literal).is_some(),
             Self::Direction => parse_direction(literal).is_some(),
             Self::Count => parse_count(literal).is_some(),
-            Self::Letter => parse_letter(literal).is_some(),
-            Self::Choice(choices) => choices.contains_key(literal),
             Self::Union(members) => members.iter().any(|member| member.accepts_literal(literal)),
             Self::Rest => true,
+        }
+    }
+
+    /// Parse one spoken word as a personal capture value. Tokens without a
+    /// personal value kind (literals, compiled directions and counts, and
+    /// trailing text) never capture a single word.
+    fn capture(&self, word: &str) -> Option<CapturedValue> {
+        match self {
+            Self::Digit { min, max } => parse_digit(word)
+                .filter(|digit| digit >= min && digit <= max)
+                .map(CapturedValue::Digit),
+            Self::Letter => parse_letter(word).map(CapturedValue::Letter),
+            Self::Choice(choices) => choices.get(word).cloned().map(CapturedValue::Choice),
+            Self::Union(members) => members.iter().find_map(|member| member.capture(word)),
+            Self::Literal(_) | Self::Direction | Self::Count | Self::Rest => None,
         }
     }
 }
@@ -173,19 +184,73 @@ impl PersonalCapture {
             Self::Text => PatternToken::Rest,
         }
     }
+}
 
-    fn parse_word(&self, word: &str) -> Option<CapturedValue> {
+/// One position of a compiled personal phrase.
+enum Slot {
+    Literal(String),
+    Capture { name: String, token: PatternToken },
+}
+
+impl Slot {
+    fn token(&self) -> PatternToken {
         match self {
-            Self::Digit { min, max } => {
-                let digit = parse_digit(word)?;
-                (digit >= *min && digit <= *max).then_some(CapturedValue::Digit(digit))
-            }
-            Self::Letter => parse_letter(word).map(CapturedValue::Letter),
-            Self::Choice { choices } => choices.get(word).cloned().map(CapturedValue::Choice),
-            Self::Union { members } => members.iter().find_map(|member| member.parse_word(word)),
-            Self::Text => None,
+            Self::Literal(word) => PatternToken::Literal(word.clone()),
+            Self::Capture { token, .. } => token.clone(),
         }
     }
+
+    fn literals(text: &str) -> Vec<Self> {
+        normalize(text)
+            .split_whitespace()
+            .map(|word| Self::Literal(word.to_string()))
+            .collect()
+    }
+}
+
+fn slot_pattern(display: String, slots: Vec<Slot>) -> TypedPattern<CapturedValues> {
+    let signature = slots.iter().map(Slot::token).collect();
+    TypedPattern {
+        display,
+        signatures: vec![signature],
+        parse: Box::new(move |heard| parse_slots(&slots, heard)),
+    }
+}
+
+fn parse_slots(slots: &[Slot], heard: &[&str]) -> Option<CapturedValues> {
+    let mut values = BTreeMap::new();
+    let mut index = 0;
+    for slot in slots {
+        match slot {
+            Slot::Literal(word) => {
+                if heard.get(index).copied() != Some(word.as_str()) {
+                    return None;
+                }
+                index += 1;
+            }
+            Slot::Capture {
+                name,
+                token: PatternToken::Rest,
+            } => {
+                let rest = heard.get(index..)?;
+                if rest.is_empty() || rest.len() > MAX_CAPTURE_WORDS {
+                    return None;
+                }
+                let text = rest.join(" ");
+                if text.len() > MAX_CAPTURE_BYTES {
+                    return None;
+                }
+                values.insert(name.clone(), CapturedValue::Text(text));
+                index = heard.len();
+            }
+            Slot::Capture { name, token } => {
+                let value = token.capture(heard.get(index)?)?;
+                values.insert(name.clone(), value);
+                index += 1;
+            }
+        }
+    }
+    (index == heard.len()).then_some(values)
 }
 
 type CaptureParser<C> = dyn Fn(&[&str]) -> Option<C> + Send + Sync;
@@ -376,53 +441,25 @@ pub(crate) fn phrase_placeholder(phrase: &str) -> Result<Option<String>, String>
 /// Compile a personal phrase that may end in a `{name}` capture placeholder.
 fn capture_pattern(phrase: String) -> Result<TypedPattern<CapturedValues>, String> {
     let Some(name) = phrase_placeholder(&phrase)? else {
-        let words = normalize(&phrase)
-            .split_whitespace()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let signature = words.iter().cloned().map(PatternToken::Literal).collect();
-        return Ok(TypedPattern {
-            display: phrase,
-            signatures: vec![signature],
-            parse: Box::new(move |heard| (heard == words).then_some(BTreeMap::new())),
-        });
+        let slots = Slot::literals(&phrase);
+        return Ok(slot_pattern(phrase, slots));
     };
     let open = phrase.find('{').expect("placeholder was validated");
-    let words = normalize(&phrase[..open])
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let signature = words
-        .iter()
-        .cloned()
-        .map(PatternToken::Literal)
-        .chain([PatternToken::Rest])
+    let slots = Slot::literals(&phrase[..open])
+        .into_iter()
+        .chain([Slot::Capture {
+            name,
+            token: PatternToken::Rest,
+        }])
         .collect();
-    Ok(TypedPattern {
-        display: phrase.trim().to_string(),
-        signatures: vec![signature],
-        parse: Box::new(move |heard| {
-            if heard.len() <= words.len() {
-                return None;
-            }
-            let (prefix, rest) = heard.split_at(words.len());
-            if prefix != words || rest.len() > MAX_CAPTURE_WORDS {
-                return None;
-            }
-            let text = rest.join(" ");
-            if text.len() > MAX_CAPTURE_BYTES {
-                return None;
-            }
-            Some(BTreeMap::from([(name.clone(), CapturedValue::Text(text))]))
-        }),
-    })
+    Ok(slot_pattern(phrase.trim().to_string(), slots))
 }
 
 fn schema_capture_pattern(
     phrase: String,
     captures: &BTreeMap<String, PersonalCapture>,
 ) -> Result<TypedPattern<CapturedValues>, String> {
-    let mut tokens = Vec::new();
+    let mut slots = Vec::new();
     let mut names = HashSet::new();
     for raw in phrase.split_whitespace() {
         if raw.starts_with('{') || raw.ends_with('}') {
@@ -441,13 +478,12 @@ fn schema_capture_pattern(
             if !names.insert(name.to_string()) {
                 return Err(format!("capture {{{name}}} must appear exactly once"));
             }
-            tokens.push(capture.pattern_token());
+            slots.push(Slot::Capture {
+                name: name.to_string(),
+                token: capture.pattern_token(),
+            });
         } else {
-            tokens.extend(
-                normalize(raw)
-                    .split_whitespace()
-                    .map(|word| PatternToken::Literal(word.to_string())),
-            );
+            slots.extend(Slot::literals(raw));
         }
     }
     if names.len() != captures.len() {
@@ -457,60 +493,22 @@ fn schema_capture_pattern(
             .expect("capture count differs");
         return Err(format!("capture {{{missing}}} must appear exactly once"));
     }
-    if tokens.is_empty() {
+    if slots.is_empty() {
         return Err("a command phrase must contain a spoken word".into());
     }
-    if let Some(index) = tokens
-        .iter()
-        .position(|token| matches!(token, PatternToken::Rest))
-        && index + 1 != tokens.len()
+    if let Some(index) = slots.iter().position(|slot| {
+        matches!(
+            slot,
+            Slot::Capture {
+                token: PatternToken::Rest,
+                ..
+            }
+        )
+    }) && index + 1 != slots.len()
     {
         return Err("text() captures must be trailing".into());
     }
-    let parse_captures = captures.clone();
-    Ok(TypedPattern {
-        display: phrase.trim().to_string(),
-        signatures: vec![tokens],
-        parse: Box::new(move |heard| {
-            let mut values = BTreeMap::new();
-            let mut word_index = 0;
-            for part in phrase.split_whitespace() {
-                if part.starts_with('{') {
-                    let name = &part[1..part.len() - 1];
-                    match parse_captures.get(name)? {
-                        capture @ (PersonalCapture::Digit { .. }
-                        | PersonalCapture::Letter
-                        | PersonalCapture::Choice { .. }
-                        | PersonalCapture::Union { .. }) => {
-                            let value = capture.parse_word(heard.get(word_index)?)?;
-                            values.insert(name.to_string(), value);
-                            word_index += 1;
-                        }
-                        PersonalCapture::Text => {
-                            let rest = heard.get(word_index..)?;
-                            if rest.is_empty() || rest.len() > MAX_CAPTURE_WORDS {
-                                return None;
-                            }
-                            let text = rest.join(" ");
-                            if text.len() > MAX_CAPTURE_BYTES {
-                                return None;
-                            }
-                            values.insert(name.to_string(), CapturedValue::Text(text));
-                            word_index = heard.len();
-                        }
-                    }
-                } else {
-                    for literal in normalize(part).split_whitespace() {
-                        if heard.get(word_index).copied() != Some(literal) {
-                            return None;
-                        }
-                        word_index += 1;
-                    }
-                }
-            }
-            (word_index == heard.len()).then_some(values)
-        }),
-    })
+    Ok(slot_pattern(phrase.trim().to_string(), slots))
 }
 
 fn validate_capture_name(name: &str) -> Result<(), String> {
