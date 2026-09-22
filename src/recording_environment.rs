@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::path::Path;
 use std::process::Command;
 use std::ptr::NonNull;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
+use objc2_app_kit::NSWorkspace;
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
     kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
@@ -318,14 +319,7 @@ fn volume_address() -> AudioObjectPropertyAddress {
 }
 
 fn pause_media() -> Vec<String> {
-    let mut script = format!("set pausedPlayers to {{}}\n{PAUSE_MUSIC}");
-    if Path::new("/Applications/Spotify.app").exists() {
-        script.push_str(PAUSE_SPOTIFY);
-    }
-    if Path::new("/Applications/VLC.app").exists() {
-        script.push_str(PAUSE_VLC);
-    }
-    script.push_str("return pausedPlayers\n");
+    let script = pause_media_script(&running_media_players());
     let output = Command::new("/usr/bin/osascript")
         .args(["-e", &script])
         .output();
@@ -348,8 +342,10 @@ fn pause_media() -> Vec<String> {
 }
 
 fn resume_media(players: &[String]) {
+    let running = running_media_players();
     let script = players
         .iter()
+        .filter(|player| running.contains(player.as_str()))
         .filter_map(|player| match player.as_str() {
             "Music" => {
                 Some("if application \"Music\" is running then tell application \"Music\" to play")
@@ -381,6 +377,39 @@ fn resume_media(players: &[String]) {
         ),
         Err(error) => tracing::warn!(%error, "could not resume media after dictation"),
     }
+}
+
+fn running_media_players() -> HashSet<&'static str> {
+    objc2::rc::autoreleasepool(|_| {
+        NSWorkspace::sharedWorkspace()
+            .runningApplications()
+            .iter()
+            .filter_map(|application| {
+                let bundle_id = application.bundleIdentifier()?;
+                match bundle_id.to_string().as_str() {
+                    "com.apple.Music" => Some("Music"),
+                    "com.spotify.client" => Some("Spotify"),
+                    "org.videolan.vlc" => Some("VLC"),
+                    _ => None,
+                }
+            })
+            .collect()
+    })
+}
+
+fn pause_media_script(players: &HashSet<&str>) -> String {
+    let mut script = String::from("set pausedPlayers to {}\n");
+    for (player, fragment) in [
+        ("Music", PAUSE_MUSIC),
+        ("Spotify", PAUSE_SPOTIFY),
+        ("VLC", PAUSE_VLC),
+    ] {
+        if players.contains(player) {
+            script.push_str(fragment);
+        }
+    }
+    script.push_str("return pausedPlayers\n");
+    script
 }
 
 #[cfg(test)]
@@ -495,5 +524,16 @@ mod tests {
             events.recv_timeout(Duration::from_secs(2)),
             Err(RecvTimeoutError::Disconnected)
         );
+    }
+
+    #[test]
+    fn pause_script_never_resolves_players_that_are_not_running() {
+        let players = HashSet::from(["Music", "Spotify"]);
+
+        let script = pause_media_script(&players);
+
+        assert!(script.contains("application \"Music\""));
+        assert!(script.contains("application \"Spotify\""));
+        assert!(!script.contains("application \"VLC\""));
     }
 }

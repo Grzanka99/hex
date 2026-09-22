@@ -239,7 +239,8 @@ Settings                                 // settings
 │   └── Release when idle -> Open on press; no pre-roll; startup delay
 │       └── Commands enabled? -> Confirm turning Commands off
 ├── While dictating -> Mute / Pause media / Do nothing
-│   └── Intentional capture only, not ordinary shortcut chords
+│   ├── Intentional capture only, not ordinary shortcut chords
+│   └── Pause/resume only players already reported running by macOS
 └── Sound volume -> Immediate feedback setting; zero suppresses tones
 
 Intentional recording                    // recording.environment
@@ -256,8 +257,10 @@ Persistence, conflict, and ownership checks live in
 [audio.rs](../../src/audio.rs). Settings previews do not prove physical device
 switching or native mute support; muting is best-effort, not universal. The
 recording-environment ownership checks cover overlapping acquisition and release,
-not a managed-device policy or native power assertion. An opt-in native assertion
-smoke exercises IOKit without starting microphone capture.
+not a managed-device policy or native power assertion. The pause-script regression
+checks that inactive players are absent before AppleScript application resolution;
+it does not exercise Music, Spotify, or VLC through Automation. An opt-in native
+assertion smoke exercises IOKit without starting microphone capture.
 
 **Easy to misread:** an open microphone is not an active recording. Sleeping
 Commands still needs open input; it is not Release when idle.
