@@ -142,6 +142,7 @@ pub enum Launch {
     /// The dictation HUD driven by a synthetic capture loop, without recognition.
     DictationHudPreview,
     /// Developer meeting detection; `offer_preview` shows an offer immediately.
+    #[cfg(debug_assertions)]
     MeetingWatch { offer_preview: bool },
     /// One isolated, deterministic UI preview without app services.
     Shell(crate::app_window::AppWindowPreview),
@@ -163,6 +164,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     let (listener, dictation_preview, preview, shell_preview) = match launch {
         Launch::App(listener) => (Some(listener), false, false, None),
         Launch::DictationHudPreview => (None, true, false, None),
+        #[cfg(debug_assertions)]
         Launch::MeetingWatch { offer_preview } => (None, false, offer_preview, None),
         Launch::Shell(shell_preview) => (None, false, false, Some(shell_preview)),
     };
