@@ -48,6 +48,8 @@ pub mod dictation_processor;
 mod events;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod feedback;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod gguf_session;
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 mod history;
 mod instance;

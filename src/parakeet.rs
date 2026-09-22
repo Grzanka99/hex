@@ -16,13 +16,14 @@ use transcribe_cpp::{
 use crate::context::ContextSnapshot;
 use crate::dictation::{DictationClip, DictationProtocol, pad_for_parakeet};
 use crate::dictation_processor::ProcessingObservation;
+use crate::gguf_session::OfflineGgufSession;
 use crate::history::{History, HistoryDraft, HistoryKind};
 use crate::meeting::{self, TranscriptEntry, TranscriptPublication};
 use crate::paste::{PasteMode, Paster};
 use crate::suppression::InputActivity;
 #[cfg(test)]
 use crate::text_replacements::ReplacementSet;
-use crate::transcription::{OfflineGgufSession, Transcriber, WarmTranscriber};
+use crate::transcription::{Transcriber, WarmTranscriber};
 use crate::transcription_models::{
     TranscriptionModelId, TranscriptionSelection, model_path, validate,
 };

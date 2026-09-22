@@ -67,6 +67,9 @@ substitute for source inspection or a second roadmap.
 - `apple_speech`: the Swift `SpeechAnalyzer` bridge with per-locale support
   checks, asset reservation, and batch transcription.
 - `transcription`: runtime selection and transactional warm-model activation.
+- `gguf_session`: the `transcribe.cpp` session owner shared by `parakeet` and
+  `linux_transcriber`; it recreates the native session around each run so
+  inference scratch stays bounded.
 - `transcription_preparation`: application-owned model preparation shared by
   Settings and the menu bar, with one worker, latest-choice pending admission,
   cancellation fences, and an installed-only path that never downloads a model.
