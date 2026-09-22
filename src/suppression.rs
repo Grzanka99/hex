@@ -477,12 +477,12 @@ unsafe extern "C" fn event_callback(
         .shortcut_suppression
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let suppress =
-        suppression.process_escape(
-            input,
-            delivered,
-            context.escape_cancels.load(Ordering::Acquire),
-        ) || suppression.process_all(input, crate::app_settings::runtime_hotkeys(), delivered);
+    let suppress = suppression.process_all(
+        input,
+        crate::app_settings::runtime_hotkeys(),
+        delivered,
+        context.escape_cancels.load(Ordering::Acquire),
+    );
     context.activity.observe(input, suppress);
     if suppress { ptr::null_mut() } else { event }
 }
@@ -509,16 +509,20 @@ fn send_input(context: &EventTapContext, event: InputEvent, capture_at: CaptureI
 struct ShortcutSuppression {
     // Repeats and releases keep the original press's suppression decision.
     key_presses: HashMap<u16, bool>,
-    escape_pressed: bool,
 }
 
 impl ShortcutSuppression {
     fn reset(&mut self) {
         self.key_presses.clear();
-        self.escape_pressed = false;
     }
 
-    fn process_all(&mut self, input: InputEvent, hotkeys: RuntimeHotkeys, delivered: bool) -> bool {
+    fn process_all(
+        &mut self,
+        input: InputEvent,
+        hotkeys: RuntimeHotkeys,
+        delivered: bool,
+        escape_cancels: bool,
+    ) -> bool {
         let bindings = [
             Some(hotkeys.dictation),
             hotkeys.edit,
@@ -532,10 +536,11 @@ impl ShortcutSuppression {
                 flags,
             } => *self.key_presses.entry(code).or_insert_with(|| {
                 delivered
-                    && bindings
-                        .iter()
-                        .flatten()
-                        .any(|hotkey| hotkey.matches_key_press(code, flags))
+                    && ((code == ESCAPE_KEY_CODE && escape_cancels)
+                        || bindings
+                            .iter()
+                            .flatten()
+                            .any(|hotkey| hotkey.matches_key_press(code, flags)))
             }),
             InputEvent::Key {
                 code, down: false, ..
@@ -565,26 +570,8 @@ impl ShortcutSuppression {
                 paste_meeting: Some(paste_meeting),
             },
             delivered,
+            false,
         )
-    }
-
-    fn process_escape(&mut self, input: InputEvent, delivered: bool, escape_cancels: bool) -> bool {
-        match input {
-            InputEvent::Key {
-                code: ESCAPE_KEY_CODE,
-                down: true,
-                ..
-            } if delivered && escape_cancels => {
-                self.escape_pressed = true;
-                true
-            }
-            InputEvent::Key {
-                code: ESCAPE_KEY_CODE,
-                down: false,
-                ..
-            } if std::mem::take(&mut self.escape_pressed) => true,
-            _ => false,
-        }
     }
 }
 
@@ -2672,26 +2659,31 @@ mod tests {
             let mut suppression = ShortcutSuppression::default();
             settings.voice_action.enabled = enabled;
             assert_eq!(
-                suppression.process_all(event(true), settings.runtime_hotkeys(), true),
+                suppression.process_all(event(true), settings.runtime_hotkeys(), true, false),
                 enabled
             );
             settings.voice_action.enabled = !enabled;
             for delivered in [true, false] {
                 assert_eq!(
-                    suppression.process_all(event(true), settings.runtime_hotkeys(), delivered),
+                    suppression.process_all(
+                        event(true),
+                        settings.runtime_hotkeys(),
+                        delivered,
+                        false
+                    ),
                     enabled
                 );
             }
             assert_eq!(
-                suppression.process_all(event(false), settings.runtime_hotkeys(), true),
+                suppression.process_all(event(false), settings.runtime_hotkeys(), true, false),
                 enabled
             );
             assert_eq!(
-                suppression.process_all(event(true), settings.runtime_hotkeys(), true),
+                suppression.process_all(event(true), settings.runtime_hotkeys(), true, false),
                 !enabled
             );
             assert_eq!(
-                suppression.process_all(event(false), settings.runtime_hotkeys(), true),
+                suppression.process_all(event(false), settings.runtime_hotkeys(), true, false),
                 !enabled
             );
         }
@@ -3076,6 +3068,7 @@ mod tests {
     #[test]
     fn escape_is_suppressed_while_it_controls_dictation() {
         let mut suppression = ShortcutSuppression::default();
+        let hotkeys = RuntimeHotkeys::default();
         let down = InputEvent::Key {
             code: ESCAPE_KEY_CODE,
             down: true,
@@ -3087,9 +3080,17 @@ mod tests {
             flags: NO_FLAGS,
         };
 
-        assert!(!suppression.process_escape(down, true, false));
-        assert!(suppression.process_escape(down, true, true));
-        assert!(suppression.process_escape(up, true, false));
+        assert!(!suppression.process_all(down, hotkeys, true, false));
+        assert!(!suppression.process_all(up, hotkeys, true, false));
+        assert!(!suppression.process_all(down, hotkeys, false, true));
+        assert!(!suppression.process_all(up, hotkeys, false, true));
+
+        // Cancelling the capture clears escape_cancels before the key lifts;
+        // the repeat and release keep the press's suppression decision.
+        assert!(suppression.process_all(down, hotkeys, true, true));
+        assert!(suppression.process_all(down, hotkeys, true, false));
+        assert!(suppression.process_all(up, hotkeys, true, false));
+        assert!(!suppression.process_all(down, hotkeys, true, false));
     }
 
     #[test]
