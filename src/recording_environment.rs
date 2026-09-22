@@ -18,42 +18,62 @@ use crate::app_settings::{self, RecordingAudioBehavior};
 
 const VIRTUAL_MAIN_VOLUME: u32 = u32::from_be_bytes(*b"vmvc");
 const POWER_ASSERTION_LEVEL_ON: u32 = 255;
-const PAUSE_MUSIC: &str = r#"
-try
-  if application "Music" is running then
-    tell application "Music"
-      if player state is playing then
-        pause
-        set end of pausedPlayers to "Music"
-      end if
-    end tell
-  end if
-end try
-"#;
-const PAUSE_SPOTIFY: &str = r#"
-try
-  if application "Spotify" is running then
-    tell application "Spotify"
-      if player state is playing then
-        pause
-        set end of pausedPlayers to "Spotify"
-      end if
-    end tell
-  end if
-end try
-"#;
-const PAUSE_VLC: &str = r#"
-try
-  if application "VLC" is running then
-    tell application "VLC"
-      if playing then
-        pause
-        set end of pausedPlayers to "VLC"
-      end if
-    end tell
-  end if
-end try
-"#;
+
+/// A media player HEX may pause for dictation and resume afterwards.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MediaPlayer {
+    Music,
+    Spotify,
+    Vlc,
+}
+
+impl MediaPlayer {
+    const ALL: [Self; 3] = [Self::Music, Self::Spotify, Self::Vlc];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Music => "Music",
+            Self::Spotify => "Spotify",
+            Self::Vlc => "VLC",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|player| player.name() == name)
+    }
+
+    fn from_bundle_id(bundle_id: &str) -> Option<Self> {
+        match bundle_id {
+            "com.apple.Music" => Some(Self::Music),
+            "com.spotify.client" => Some(Self::Spotify),
+            "org.videolan.vlc" => Some(Self::Vlc),
+            _ => None,
+        }
+    }
+
+    /// The AppleScript condition that is true while the player is playing.
+    fn playing_clause(self) -> &'static str {
+        match self {
+            Self::Music | Self::Spotify => "player state is playing",
+            Self::Vlc => "playing",
+        }
+    }
+
+    fn pause_fragment(self) -> String {
+        let name = self.name();
+        let playing = self.playing_clause();
+        format!(
+            "\ntry\n  if application \"{name}\" is running then\n    tell application \"{name}\"\n      if {playing} then\n        pause\n        set end of pausedPlayers to \"{name}\"\n      end if\n    end tell\n  end if\nend try\n"
+        )
+    }
+
+    fn resume_fragment(self) -> String {
+        let name = self.name();
+        format!(
+            "try\n  if application \"{name}\" is running then tell application \"{name}\" to play\nend try"
+        )
+    }
+}
 
 struct RecordingEnvironment {
     _sleep: Option<PreventSleep>,
@@ -205,7 +225,7 @@ unsafe extern "C" {
 
 enum AudioBehaviorGuard {
     Muted { device: u32, previous: f32 },
-    Paused { players: Vec<String> },
+    Paused { players: Vec<MediaPlayer> },
     None,
 }
 
@@ -318,7 +338,7 @@ fn volume_address() -> AudioObjectPropertyAddress {
     }
 }
 
-fn pause_media() -> Vec<String> {
+fn pause_media() -> Vec<MediaPlayer> {
     let script = pause_media_script(&running_media_players());
     let output = Command::new("/usr/bin/osascript")
         .args(["-e", &script])
@@ -336,29 +356,16 @@ fn pause_media() -> Vec<String> {
     String::from_utf8_lossy(&output.stdout)
         .split(',')
         .map(str::trim)
-        .filter(|player| matches!(*player, "Music" | "Spotify" | "VLC"))
-        .map(str::to_string)
+        .filter_map(MediaPlayer::from_name)
         .collect()
 }
 
-fn resume_media(players: &[String]) {
+fn resume_media(players: &[MediaPlayer]) {
     let running = running_media_players();
     let script = players
         .iter()
-        .filter(|player| running.contains(player.as_str()))
-        .filter_map(|player| match player.as_str() {
-            "Music" => {
-                Some("if application \"Music\" is running then tell application \"Music\" to play")
-            }
-            "Spotify" => Some(
-                "if application \"Spotify\" is running then tell application \"Spotify\" to play",
-            ),
-            "VLC" => {
-                Some("if application \"VLC\" is running then tell application \"VLC\" to play")
-            }
-            _ => None,
-        })
-        .map(|command| format!("try\n  {command}\nend try"))
+        .filter(|player| running.contains(player))
+        .map(|player| player.resume_fragment())
         .collect::<Vec<_>>()
         .join("\n");
     if script.is_empty() {
@@ -379,33 +386,23 @@ fn resume_media(players: &[String]) {
     }
 }
 
-fn running_media_players() -> HashSet<&'static str> {
+fn running_media_players() -> HashSet<MediaPlayer> {
     objc2::rc::autoreleasepool(|_| {
         NSWorkspace::sharedWorkspace()
             .runningApplications()
             .iter()
             .filter_map(|application| {
-                let bundle_id = application.bundleIdentifier()?;
-                match bundle_id.to_string().as_str() {
-                    "com.apple.Music" => Some("Music"),
-                    "com.spotify.client" => Some("Spotify"),
-                    "org.videolan.vlc" => Some("VLC"),
-                    _ => None,
-                }
+                MediaPlayer::from_bundle_id(&application.bundleIdentifier()?.to_string())
             })
             .collect()
     })
 }
 
-fn pause_media_script(players: &HashSet<&str>) -> String {
+fn pause_media_script(players: &HashSet<MediaPlayer>) -> String {
     let mut script = String::from("set pausedPlayers to {}\n");
-    for (player, fragment) in [
-        ("Music", PAUSE_MUSIC),
-        ("Spotify", PAUSE_SPOTIFY),
-        ("VLC", PAUSE_VLC),
-    ] {
-        if players.contains(player) {
-            script.push_str(fragment);
+    for player in MediaPlayer::ALL {
+        if players.contains(&player) {
+            script.push_str(&player.pause_fragment());
         }
     }
     script.push_str("return pausedPlayers\n");
@@ -528,12 +525,37 @@ mod tests {
 
     #[test]
     fn pause_script_never_resolves_players_that_are_not_running() {
-        let players = HashSet::from(["Music", "Spotify"]);
+        let players = HashSet::from([MediaPlayer::Music, MediaPlayer::Spotify]);
 
         let script = pause_media_script(&players);
 
         assert!(script.contains("application \"Music\""));
         assert!(script.contains("application \"Spotify\""));
         assert!(!script.contains("application \"VLC\""));
+
+        let script = pause_media_script(&HashSet::from([MediaPlayer::Vlc]));
+
+        assert_eq!(
+            script,
+            r#"set pausedPlayers to {}
+
+try
+  if application "VLC" is running then
+    tell application "VLC"
+      if playing then
+        pause
+        set end of pausedPlayers to "VLC"
+      end if
+    end tell
+  end if
+end try
+return pausedPlayers
+"#
+        );
+        assert!(!script.contains("player state is playing"));
+        assert!(
+            pause_media_script(&HashSet::from([MediaPlayer::Music]))
+                .contains("if player state is playing then")
+        );
     }
 }
