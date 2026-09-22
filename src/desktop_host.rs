@@ -6,7 +6,6 @@ use crate::transcription_models::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) struct DesktopCapabilities {
     pub(crate) activity: bool,
     pub(crate) commands: bool,
@@ -38,8 +37,7 @@ impl DesktopCapabilities {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    pub(crate) const fn linux_x11() -> Self {
+        pub(crate) const fn linux_x11() -> Self {
         Self {
             activity: false,
             commands: false,
@@ -83,7 +81,6 @@ pub(crate) struct DesktopListenerSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) enum DesktopUpdateStatus {
     Unavailable,
     Checking,
@@ -105,7 +102,6 @@ pub(crate) struct DesktopShortcut {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) enum DesktopAction {
     ClearError,
     RestartIntoUpdate,
@@ -117,8 +113,7 @@ pub(crate) enum DesktopAction {
 }
 
 pub(crate) trait DesktopHost {
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
-    fn capabilities(&self) -> DesktopCapabilities;
+        fn capabilities(&self) -> DesktopCapabilities;
     fn snapshot(&self) -> DesktopSnapshot;
     fn dispatch(&mut self, action: DesktopAction) -> Result<()>;
 }

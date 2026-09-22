@@ -449,7 +449,6 @@ enum Pane {
     HudLab,
     Meetings,
     Commands,
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     Activity,
     History,
     Modes,

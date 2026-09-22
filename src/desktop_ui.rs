@@ -6,7 +6,6 @@ use gpui::{Image, ImageFormat, img};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) enum NavigationIcon {
     Activity,
     Commands,
@@ -114,7 +113,6 @@ fn navigation_icon(icon: NavigationIcon, selected: bool) -> AnyElement {
     img(Arc::new(image)).size(px(16.0)).into_any_element()
 }
 
-#[allow(dead_code)]
 pub(crate) const SIDEBAR_WIDTH: f32 = 220.0;
 
 pub(crate) const CANVAS: u32 = 0x111111;
@@ -132,16 +130,11 @@ pub(crate) const FAINT: u32 = 0x626262;
 pub(crate) const NEGATIVE: u32 = 0xc98f89;
 
 pub(crate) const CONTROL_HEIGHT: f32 = 32.0;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const TEXT_INPUT_HEIGHT: f32 = 34.0;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const MULTILINE_INPUT_HEIGHT: f32 = 132.0;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const COMPACT_MULTILINE_INPUT_HEIGHT: f32 = 76.0;
 pub(crate) const PANEL_RADIUS: f32 = 10.0;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const COMPACT_PANEL_HEADER_HEIGHT: f32 = 38.0;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const SECTION_GAP: f32 = 8.0;
 
 pub(crate) fn window_frame() -> Div {
@@ -163,7 +156,6 @@ pub(crate) fn sidebar_frame() -> Div {
         .border_color(rgb(LINE))
 }
 
-#[allow(dead_code)]
 pub(crate) fn navigation_item(icon: NavigationIcon, selected: bool) -> Div {
     div()
         .h(px(38.0))
@@ -196,7 +188,6 @@ pub(crate) fn navigation_item(icon: NavigationIcon, selected: bool) -> Div {
 pub(crate) const PANE_CONTENT_WIDTH: f32 = 940.0;
 
 /// The one fixed list-column width every list+detail pane uses.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const PANE_LIST_WIDTH: f32 = 320.0;
 
 pub(crate) fn pane_header(title: &'static str) -> AnyElement {
@@ -238,7 +229,6 @@ pub(crate) fn pane_header_with_action(
 
 /// The one pane body: fills the space under the header and centers its
 /// children. Put the pane's content column inside [`pane_content`].
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn pane_body() -> Div {
     div()
         .flex_1()
@@ -250,7 +240,6 @@ pub(crate) fn pane_body() -> Div {
 
 /// The one pane-header action button: a bordered 30-point chip. Every
 /// clickable header action renders this.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn header_button(label: impl IntoElement) -> Div {
     div()
         .h(px(30.0))
@@ -268,7 +257,6 @@ pub(crate) fn header_button(label: impl IntoElement) -> Div {
 }
 
 /// The one pane content column, bounded to [`PANE_CONTENT_WIDTH`].
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn pane_content() -> Div {
     div()
         .w_full()
@@ -278,7 +266,6 @@ pub(crate) fn pane_content() -> Div {
         .flex_col()
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn section_label(label: &'static str) -> AnyElement {
     div()
         .text_size(px(11.0))
@@ -288,7 +275,6 @@ pub(crate) fn section_label(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn listener_status(
     status: impl IntoElement,
     device: impl IntoElement,
@@ -400,7 +386,6 @@ pub(crate) fn toggle(position: f32) -> AnyElement {
         .into_any_element()
 }
 
-#[allow(dead_code)]
 pub(crate) fn settings_section_label(label: &'static str) -> AnyElement {
     div()
         .pt_5()
@@ -413,7 +398,6 @@ pub(crate) fn settings_section_label(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-#[allow(dead_code)]
 pub(crate) fn settings_copy(title: &'static str, description: &'static str) -> AnyElement {
     div()
         .debug_selector(|| "settings-copy".into())
@@ -469,7 +453,6 @@ pub(crate) fn compact_panel() -> Div {
         .overflow_hidden()
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn compact_panel_header(title: impl IntoElement, action: Option<AnyElement>) -> Div {
     div()
         .h(px(COMPACT_PANEL_HEADER_HEIGHT))
@@ -490,7 +473,6 @@ pub(crate) fn compact_panel_header(title: impl IntoElement, action: Option<AnyEl
         .when_some(action, |header, action| header.child(action))
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn compact_section_label(label: impl IntoElement) -> Div {
     div()
         .px_1()
@@ -500,7 +482,6 @@ pub(crate) fn compact_section_label(label: impl IntoElement) -> Div {
         .child(label)
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
     div()
         .w(px(220.0))
@@ -529,7 +510,6 @@ pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
         )
 }
 
-#[allow(dead_code)]
 pub(crate) fn settings_row(
     title: &'static str,
     description: &'static str,
@@ -555,12 +535,10 @@ pub(crate) fn settings_row(
         .child(control)
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn settings_panel() -> Div {
     compact_panel().relative()
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn segmented_control() -> Div {
     div()
         .h(px(CONTROL_HEIGHT))
@@ -574,7 +552,6 @@ pub(crate) fn segmented_control() -> Div {
         .bg(rgb(CANVAS))
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn segmented_item(selected: bool) -> Div {
     div()
         .h(px(26.0))
@@ -603,7 +580,6 @@ pub(crate) fn mix_color(from: Rgba, to: Rgba, position: f32) -> Rgba {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn empty_message(message: &'static str) -> AnyElement {
     div()
         .p_6()
@@ -613,7 +589,6 @@ pub(crate) fn empty_message(message: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-#[allow(dead_code)]
 pub(crate) fn error_message(message: &'static str, error: String) -> AnyElement {
     div()
         .p_6()
