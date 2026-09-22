@@ -171,18 +171,14 @@ fn run_with_shell_preview(
     let local_api = event_log
         .as_ref()
         .map(|events| {
-            if crate::DEVELOPER_FEATURES_ENABLED {
-                crate::local_api::LocalApi::start_with_developer_control_and_dictation(
-                    events.clone(),
-                    developer_sender.clone(),
-                    recognition_control_sender.clone(),
-                )
-            } else {
-                crate::local_api::LocalApi::start_with_dictation(
-                    events.clone(),
-                    recognition_control_sender.clone(),
-                )
-            }
+            crate::local_api::LocalApi::start(
+                events.clone(),
+                crate::local_api::LocalApiOptions {
+                    developer_control: crate::DEVELOPER_FEATURES_ENABLED
+                        .then(|| developer_sender.clone()),
+                    dictation_control: Some(recognition_control_sender.clone()),
+                },
+            )
         })
         .transpose()?;
     let meeting_project_root = listener

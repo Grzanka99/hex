@@ -579,7 +579,7 @@ fn main() -> Result<()> {
                 drop(stdout);
                 api
             } else {
-                local_api::LocalApi::start(events)?
+                local_api::LocalApi::start(events, local_api::LocalApiOptions::default())?
             };
             while !SHUTDOWN.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
