@@ -21,6 +21,8 @@ const VOICE_ACTION_PROTOCOL_PROMPT: &str = "You execute a one-off voice instruct
 const MAX_OPENCODE_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 /// Newest service info route first; older OpenCode V2 builds only serve the later names.
 const SERVICE_INFO_ENDPOINTS: [&str; 3] = ["/api/info", "/api/status", "/api/health"];
+/// Newest one-shot generation route first; older OpenCode V2 builds only serve the later name.
+const GENERATE_ENDPOINTS: [&str; 2] = ["/api/experimental/generate", "/api/generate"];
 
 #[derive(Clone)]
 pub struct Profile {
@@ -396,22 +398,16 @@ fn opencode_api<T: for<'de> Deserialize<'de>>(
     path: &str,
 ) -> Result<T> {
     // The CLI can truncate large catalog responses when stdout is piped.
-    let (command, input) = opencode_http_command(endpoint, password, path, None, Some(workspace))?;
-    let output = run_command(
-        command,
-        Some(input),
-        Duration::from_secs(10),
+    let response = opencode_http(
+        endpoint,
+        password,
         path,
+        None,
+        Some(workspace),
+        Duration::from_secs(10),
         &AtomicBool::new(false),
     )?;
-    if !output.status.success() {
-        return Err(eyre!(
-            "OpenCode {path} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let value: serde_json::Value = serde_json::from_slice(&response.body)
         .wrap_err_with(|| format!("OpenCode {path} returned invalid JSON"))?;
     if let Some(message) = value.get("message").and_then(|message| message.as_str())
         && value.get("_tag").is_some()
@@ -420,6 +416,49 @@ fn opencode_api<T: for<'de> Deserialize<'de>>(
     }
     serde_json::from_value(value)
         .wrap_err_with(|| format!("OpenCode {path} returned an invalid response"))
+}
+
+struct HttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// One authenticated loopback request through the system curl. A non-zero
+/// curl exit is a transport failure; HTTP error statuses return normally so
+/// callers can distinguish a missing route from a served error body.
+fn opencode_http(
+    endpoint: &str,
+    password: &str,
+    path: &str,
+    data: Option<&str>,
+    workspace: Option<&Path>,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+) -> Result<HttpResponse> {
+    let (command, input) = opencode_http_command(endpoint, password, path, data, workspace)?;
+    let output = run_command(command, Some(input), deadline, path, cancelled)?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "OpenCode {path} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    split_http_status(output.stdout).ok_or_else(|| eyre!("OpenCode {path} returned no HTTP status"))
+}
+
+/// curl appends `\n<status>` after the body; see `opencode_http_command`.
+fn split_http_status(mut stdout: Vec<u8>) -> Option<HttpResponse> {
+    let newline = stdout.iter().rposition(|byte| *byte == b'\n')?;
+    let status = std::str::from_utf8(&stdout[newline + 1..])
+        .ok()?
+        .parse()
+        .ok()?;
+    stdout.truncate(newline);
+    Some(HttpResponse {
+        status,
+        body: stdout,
+    })
 }
 
 pub struct Processed {
@@ -512,22 +551,11 @@ fn generate_cancellable(
         let remaining = deadline.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(eyre!(
-                "opencode2 /api/generate exceeded {} seconds",
+                "opencode2 generation exceeded {} seconds",
                 deadline.as_secs()
             ));
         }
-        let (command, input) =
-            opencode_http_command(&endpoint, &password, "/api/generate", Some(&data), None)?;
-        let output = run_command(command, Some(input), remaining, "/api/generate", cancelled)?;
-        let status = output.status;
-        if !status.success() {
-            return Err(eyre!(
-                "opencode2 exited with {status}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let response: Response = serde_json::from_slice(&output.stdout)
-            .wrap_err("opencode2 returned an invalid generation response")?;
+        let response = post_generation(&endpoint, &password, &data, remaining, cancelled)?;
         match response {
             Response::Success { data } => return Ok(data.text),
             Response::Error { message } if attempt == 0 && retryable_generation_error(&message) => {
@@ -540,6 +568,47 @@ fn generate_cancellable(
         }
     }
     unreachable!("generation loop returns on its second attempt")
+}
+
+/// Posts to the newest generation route and falls back to the older name only
+/// when the server reports that route missing. Every attempt shares one deadline.
+fn post_generation(
+    endpoint: &str,
+    password: &str,
+    data: &str,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Response> {
+    let started = Instant::now();
+    let (newest, older) = GENERATE_ENDPOINTS.split_first().expect("endpoints");
+    let mut response = opencode_http(
+        endpoint,
+        password,
+        newest,
+        Some(data),
+        None,
+        deadline,
+        cancelled,
+    )?;
+    for path in older {
+        if response.status != 404 {
+            break;
+        }
+        response = opencode_http(
+            endpoint,
+            password,
+            path,
+            Some(data),
+            None,
+            deadline.saturating_sub(started.elapsed()),
+            cancelled,
+        )?;
+    }
+    if response.status == 404 {
+        return Err(eyre!("OpenCode does not serve a generation route"));
+    }
+    serde_json::from_slice(&response.body)
+        .wrap_err("opencode2 returned an invalid generation response")
 }
 
 fn discover_opencode_service(
@@ -765,10 +834,13 @@ fn opencode_http_command(
         input.push_str("\"\n");
     }
     // Ignore curlrc, proxies, and redirects. Both credentials and body stay off argv and disk.
+    // The trailing status line lets callers tell a missing route from a served error body.
     command.args([
         "--disable",
         "--silent",
         "--show-error",
+        "--write-out",
+        "\n%{http_code}",
         "--noproxy",
         "*",
         "--proxy",
@@ -794,11 +866,11 @@ fn wait_for_generation_retry(
     let wait_started = Instant::now();
     while wait_started.elapsed() < Duration::from_millis(1_500) {
         if cancelled.load(Ordering::Acquire) {
-            return Err(eyre!("opencode2 /api/generate was cancelled"));
+            return Err(eyre!("opencode2 generation was cancelled"));
         }
         if started.elapsed() >= deadline {
             return Err(eyre!(
-                "opencode2 /api/generate exceeded {} seconds",
+                "opencode2 generation exceeded {} seconds",
                 deadline.as_secs()
             ));
         }
@@ -1761,7 +1833,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn receive_generation_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    fn receive_generation_request(stream: &mut std::net::TcpStream, path: &str) -> Vec<u8> {
         use std::io::BufRead;
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1776,7 +1848,10 @@ mod tests {
             }
             headers.push_str(&line);
         }
-        assert!(headers.starts_with("POST /api/generate HTTP/1.1\r\n"));
+        assert!(
+            headers.starts_with(&format!("POST {path} HTTP/1.1\r\n")),
+            "{headers}"
+        );
         assert!(headers.contains("Authorization: Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==\r\n"));
         let length: usize = headers
             .lines()
@@ -1800,22 +1875,38 @@ mod tests {
         body
     }
 
-    #[test]
-    fn generation_pipes_credentials_and_large_json_without_argv_exposure() {
+    /// Answers each expected route in order and returns the request bodies it saw.
+    fn generation_server(
+        routes: Vec<(&'static str, u16, &'static str)>,
+    ) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let body = receive_generation_request(&mut stream);
-            let response = r#"{"data":{"text":"fixture result"}}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-            body
+            routes
+                .into_iter()
+                .map(|(path, status, response)| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let body = receive_generation_request(&mut stream, path);
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .unwrap();
+                    body
+                })
+                .collect()
         });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn generation_pipes_credentials_and_large_json_without_argv_exposure() {
+        let (endpoint, server) = generation_server(vec![(
+            "/api/experimental/generate",
+            200,
+            r#"{"data":{"text":"fixture result"}}"#,
+        )]);
         let prompt = format!(
             "fixture prompt: \"quoted\"\\path\n\r\t\u{00e9}{}",
             "a".repeat(1024 * 1024)
@@ -1825,10 +1916,10 @@ mod tests {
             model: None,
         })
         .unwrap();
-        let (command, input) = opencode_http_command(
+        let (command, _) = opencode_http_command(
             &endpoint,
             "fixture-password",
-            "/api/generate",
+            "/api/experimental/generate",
             Some(&data),
             None,
         )
@@ -1837,19 +1928,80 @@ mod tests {
             assert!(!arg.to_string_lossy().contains("fixture"));
             assert!(!arg.to_string_lossy().contains(&prompt));
         }
-        let output = run_command(
-            command,
-            Some(input),
+        let response = post_generation(
+            &endpoint,
+            "fixture-password",
+            &data,
             Duration::from_secs(5),
-            "test generation",
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert!(output.status.success());
-        assert_eq!(server.join().unwrap(), data.as_bytes());
-        assert!(
-            matches!(serde_json::from_slice::<Response>(&output.stdout).unwrap(), Response::Success { data } if data.text == "fixture result")
+        assert!(matches!(response, Response::Success { data } if data.text == "fixture result"));
+        assert_eq!(server.join().unwrap(), [data.as_bytes()]);
+    }
+
+    #[test]
+    fn generation_falls_back_to_the_legacy_route_only_when_the_new_one_is_missing() {
+        let success = r#"{"data":{"text":"fixture result"}}"#;
+        let unavailable = r#"{"_tag":"InvalidRequestError","message":"Model unavailable: x"}"#;
+        for (routes, expected) in [
+            (
+                vec![
+                    ("/api/experimental/generate", 404, ""),
+                    ("/api/generate", 200, success),
+                ],
+                Ok("fixture result"),
+            ),
+            (
+                vec![("/api/experimental/generate", 400, unavailable)],
+                Err("Model unavailable: x"),
+            ),
+            (
+                vec![
+                    (
+                        "/api/experimental/generate",
+                        404,
+                        r#"{"error":"Not Found"}"#,
+                    ),
+                    ("/api/generate", 404, ""),
+                ],
+                Err("does not serve a generation route"),
+            ),
+        ] {
+            let requests = routes.len();
+            let (endpoint, server) = generation_server(routes);
+            let result = post_generation(
+                &endpoint,
+                "fixture-password",
+                "{}",
+                Duration::from_secs(5),
+                &AtomicBool::new(false),
+            );
+            match (result, expected) {
+                (Ok(Response::Success { data }), Ok(text)) => assert_eq!(data.text, text),
+                (Ok(Response::Error { message }), Err(text)) => assert_eq!(message, text),
+                (Err(error), Err(text)) => assert!(error.to_string().contains(text), "{error}"),
+                (result, expected) => {
+                    panic!(
+                        "unexpected outcome for {expected:?}: {:?}",
+                        result.map(|_| ())
+                    )
+                }
+            }
+            assert_eq!(server.join().unwrap().len(), requests);
+        }
+    }
+
+    #[test]
+    fn http_status_is_split_from_the_body() {
+        let response = split_http_status(b"{\"data\":1}\n200".to_vec()).unwrap();
+        assert_eq!(
+            (response.status, response.body.as_slice()),
+            (200, &b"{\"data\":1}"[..])
         );
+        let response = split_http_status(b"\n404".to_vec()).unwrap();
+        assert_eq!((response.status, response.body.as_slice()), (404, &b""[..]));
+        assert!(split_http_status(b"no status".to_vec()).is_none());
     }
 
     #[test]
@@ -1905,7 +2057,7 @@ mod tests {
             let flag = cancelled.clone();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                receive_generation_request(&mut stream);
+                receive_generation_request(&mut stream, "/api/generate");
                 flag.store(cancel, Ordering::Release);
                 let mut byte = [0];
                 assert_eq!(stream.read(&mut byte).unwrap(), 0);
