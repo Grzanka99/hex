@@ -68,6 +68,38 @@ struct MeetingUi {
     model_menu_settings: AppSettings,
 }
 
+impl MeetingUi {
+    fn open_or_focus(&self, cx: &mut App) -> gpui::Result<WindowHandle<AppWindow>> {
+        crate::app_window::open_or_focus(
+            &self.app_window,
+            self.event_path.clone(),
+            config::voice_control(),
+            self.meeting_requests.clone(),
+            self.indicator.clone(),
+            self.recognition_start.clone(),
+            self.history.clone(),
+            cx,
+        )
+    }
+
+    /// Replaces a pending offer with the app window and applies a meeting
+    /// state change to it. A failed open is logged; the update is still
+    /// attempted against any already-open window.
+    fn show_meeting_window(
+        &self,
+        offer: Option<WindowHandle<MeetingOffer>>,
+        open_failure: &'static str,
+        cx: &mut App,
+        update: impl FnOnce(&mut AppWindow, &mut Context<AppWindow>),
+    ) {
+        close_window(offer, cx);
+        if let Err(error) = self.open_or_focus(cx) {
+            tracing::error!(%error, "{open_failure}");
+        }
+        update_app_window(&self.app_window, cx, update);
+    }
+}
+
 struct RuntimeWorkers {
     local_api: Option<crate::local_api::LocalApi>,
     recognition: Option<thread::JoinHandle<()>>,
@@ -103,20 +135,16 @@ pub struct ListenerConfig {
     pub device: Option<String>,
 }
 
-pub fn run(
-    shutdown: &'static AtomicBool,
-    preview: bool,
-    listener: Option<ListenerConfig>,
-    dictation_preview: bool,
-) -> Result<()> {
-    run_with_shell_preview(shutdown, preview, listener, dictation_preview, None)
-}
-
-pub fn preview_shell(
-    shutdown: &'static AtomicBool,
-    preview: crate::app_window::AppWindowPreview,
-) -> Result<()> {
-    run_with_shell_preview(shutdown, false, None, false, Some(preview))
+/// What the desktop process hosts for its lifetime.
+pub enum Launch {
+    /// The production app with local dictation.
+    App(ListenerConfig),
+    /// The dictation HUD driven by a synthetic capture loop, without recognition.
+    DictationHudPreview,
+    /// Developer meeting detection; `offer_preview` shows an offer immediately.
+    MeetingWatch { offer_preview: bool },
+    /// One isolated, deterministic UI preview without app services.
+    Shell(crate::app_window::AppWindowPreview),
 }
 
 fn should_open_app_on_launch(
@@ -128,16 +156,16 @@ fn should_open_app_on_launch(
     show_dock_icon || !setup_ready || !onboarding_completed || !status_item_available
 }
 
-fn run_with_shell_preview(
-    shutdown: &'static AtomicBool,
-    preview: bool,
-    listener: Option<ListenerConfig>,
-    dictation_preview: bool,
-    shell_preview: Option<crate::app_window::AppWindowPreview>,
-) -> Result<()> {
+pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     if objc2::MainThreadMarker::new().is_none() {
         return Err(eyre!("desktop startup requires the main thread"));
     }
+    let (listener, dictation_preview, preview, shell_preview) = match launch {
+        Launch::App(listener) => (Some(listener), false, false, None),
+        Launch::DictationHudPreview => (None, true, false, None),
+        Launch::MeetingWatch { offer_preview } => (None, false, offer_preview, None),
+        Launch::Shell(shell_preview) => (None, false, false, Some(shell_preview)),
+    };
     shutdown.store(false, Ordering::Relaxed);
     crate::keyboard::initialize_layout()?;
     let settings = if shell_preview.is_some() {
@@ -554,68 +582,59 @@ async fn drive_ui(
                 });
             let _ = call.reply.send(reply);
         }
-        if let Some(status_actions) = &ui.status_actions {
-            while let Ok(action) = status_actions.try_recv() {
-                let result = cx.update(|cx| match action {
-                    crate::status_item::StatusItemAction::OpenSettings
-                    | crate::status_item::StatusItemAction::OpenModels => {
-                        match crate::app_window::open_or_focus(
-                            &ui.app_window,
-                            ui.event_path.clone(),
-                            config::voice_control(),
-                            ui.meeting_requests.clone(),
-                            ui.indicator.clone(),
-                            ui.recognition_start.clone(),
-                            ui.history.clone(),
-                            cx,
-                        ) {
-                            Ok(handle) => {
-                                let _ = handle.update(cx, |window, _, cx| {
-                                    if action == crate::status_item::StatusItemAction::OpenModels {
-                                        window.show_transcription_models(cx);
-                                    } else {
-                                        window.show_settings(cx);
-                                    }
-                                });
+        while let Some(action) = ui
+            .status_actions
+            .as_ref()
+            .and_then(|actions| actions.try_recv().ok())
+        {
+            let result = cx.update(|cx| match action {
+                crate::status_item::StatusItemAction::OpenSettings
+                | crate::status_item::StatusItemAction::OpenModels => match ui.open_or_focus(cx) {
+                    Ok(handle) => {
+                        let _ = handle.update(cx, |window, _, cx| {
+                            if action == crate::status_item::StatusItemAction::OpenModels {
+                                window.show_transcription_models(cx);
+                            } else {
+                                window.show_settings(cx);
                             }
-                            Err(error) => {
-                                tracing::error!(%error, "could not open HEX from status item");
-                            }
-                        }
+                        });
                     }
-                    crate::status_item::StatusItemAction::SelectModel(model) => {
-                        let (_, current) = crate::app_settings::transcription_selection();
-                        ui.model_menu_settings.transcription = current;
-                        let selection = crate::app_window::menu_transcription_selection(
-                            &ui.app_window,
-                            model,
-                            &ui.model_menu_settings,
-                            cx,
-                        );
-                        ui.transcription_preparation.start(selection, true);
-                        model_menu_refresh_at = Instant::now();
+                    Err(error) => {
+                        tracing::error!(%error, "could not open HEX from status item");
                     }
-                    crate::status_item::StatusItemAction::CancelModelPreparation => {
-                        ui.transcription_preparation.cancel();
-                        model_menu_refresh_at = Instant::now();
-                    }
-                    crate::status_item::StatusItemAction::PasteLast => {
-                        let _ = ui
-                            .recognition_controls
-                            .try_send(crate::recognition::RecognitionControl::PasteLast);
-                    }
-                    crate::status_item::StatusItemAction::CheckForUpdates => {
-                        crate::sparkle::check_for_updates();
-                    }
-                    crate::status_item::StatusItemAction::Quit => {
-                        ui.transcription_preparation.cancel();
-                        cx.quit();
-                    }
-                });
-                if let Err(error) = result {
-                    tracing::error!(%error, "could not handle HEX status item action");
-                    return;
+                },
+                crate::status_item::StatusItemAction::SelectModel(model) => {
+                    let (_, current) = crate::app_settings::transcription_selection();
+                    ui.model_menu_settings.transcription = current;
+                    let selection = crate::app_window::menu_transcription_selection(
+                        &ui.app_window,
+                        model,
+                        &ui.model_menu_settings,
+                        cx,
+                    );
+                    ui.transcription_preparation.start(selection, true);
+                    model_menu_refresh_at = Instant::now();
                 }
+                crate::status_item::StatusItemAction::CancelModelPreparation => {
+                    ui.transcription_preparation.cancel();
+                    model_menu_refresh_at = Instant::now();
+                }
+                crate::status_item::StatusItemAction::PasteLast => {
+                    let _ = ui
+                        .recognition_controls
+                        .try_send(crate::recognition::RecognitionControl::PasteLast);
+                }
+                crate::status_item::StatusItemAction::CheckForUpdates => {
+                    crate::sparkle::check_for_updates();
+                }
+                crate::status_item::StatusItemAction::Quit => {
+                    ui.transcription_preparation.cancel();
+                    cx.quit();
+                }
+            });
+            if let Err(error) = result {
+                tracing::error!(%error, "could not handle HEX status item action");
+                return;
             }
         }
         // Delivered menu cancellations/new choices win over an uncommitted completion.
@@ -656,42 +675,18 @@ async fn drive_ui(
                     close_window(offer_window.take(), cx);
                     offer_window = open_offer(candidate, ui.commands.clone(), cx).ok();
                 }
-                ControllerEvent::Starting => {
-                    close_window(offer_window.take(), cx);
-                    if let Err(error) = crate::app_window::open_or_focus(
-                        &ui.app_window,
-                        ui.event_path.clone(),
-                        config::voice_control(),
-                        ui.meeting_requests.clone(),
-                        ui.indicator.clone(),
-                        ui.recognition_start.clone(),
-                        ui.history.clone(),
-                        cx,
-                    ) {
-                        tracing::error!(%error, "could not open HEX for starting meeting");
-                    }
-                    update_app_window(&ui.app_window, cx, |window, cx| {
-                        window.meeting_starting(cx);
-                    });
-                }
-                ControllerEvent::RecordingStarted => {
-                    close_window(offer_window.take(), cx);
-                    if let Err(error) = crate::app_window::open_or_focus(
-                        &ui.app_window,
-                        ui.event_path.clone(),
-                        config::voice_control(),
-                        ui.meeting_requests.clone(),
-                        ui.indicator.clone(),
-                        ui.recognition_start.clone(),
-                        ui.history.clone(),
-                        cx,
-                    ) {
-                        tracing::error!(%error, "could not open HEX for active meeting");
-                    }
-                    update_app_window(&ui.app_window, cx, |window, cx| {
-                        window.meeting_started(cx);
-                    });
-                }
+                ControllerEvent::Starting => ui.show_meeting_window(
+                    offer_window.take(),
+                    "could not open HEX for starting meeting",
+                    cx,
+                    |window, cx| window.meeting_starting(cx),
+                ),
+                ControllerEvent::RecordingStarted => ui.show_meeting_window(
+                    offer_window.take(),
+                    "could not open HEX for active meeting",
+                    cx,
+                    |window, cx| window.meeting_started(cx),
+                ),
                 ControllerEvent::Transcribing => {
                     update_app_window(&ui.app_window, cx, |window, cx| {
                         window.meeting_updated(cx);
@@ -702,24 +697,12 @@ async fn drive_ui(
                         window.meeting_finished(cx);
                     });
                 }
-                ControllerEvent::Failed { title, error } => {
-                    close_window(offer_window.take(), cx);
-                    if let Err(open_error) = crate::app_window::open_or_focus(
-                        &ui.app_window,
-                        ui.event_path.clone(),
-                        config::voice_control(),
-                        ui.meeting_requests.clone(),
-                        ui.indicator.clone(),
-                        ui.recognition_start.clone(),
-                        ui.history.clone(),
-                        cx,
-                    ) {
-                        tracing::error!(%open_error, "could not open HEX for meeting failure");
-                    }
-                    update_app_window(&ui.app_window, cx, |window, cx| {
-                        window.meeting_failed(title, error, cx);
-                    });
-                }
+                ControllerEvent::Failed { title, error } => ui.show_meeting_window(
+                    offer_window.take(),
+                    "could not open HEX for meeting failure",
+                    cx,
+                    |window, cx| window.meeting_failed(title, error, cx),
+                ),
             });
             if let Err(error) = result {
                 tracing::error!(%error, "could not update meeting UI");
@@ -777,16 +760,7 @@ fn apply_developer_command(
             DeveloperReply::Ok
         }
         DeveloperCommand::ShowPane { pane } => {
-            let handle = match crate::app_window::open_or_focus(
-                &ui.app_window,
-                ui.event_path.clone(),
-                config::voice_control(),
-                ui.meeting_requests.clone(),
-                ui.indicator.clone(),
-                ui.recognition_start.clone(),
-                ui.history.clone(),
-                cx,
-            ) {
+            let handle = match ui.open_or_focus(cx) {
                 Ok(handle) => handle,
                 Err(error) => {
                     return DeveloperReply::error("open-window-failed", error.to_string());

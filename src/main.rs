@@ -410,16 +410,16 @@ fn main() -> Result<()> {
             preview_dictation,
         } => {
             let _instance = instance::acquire("listener")?;
-            meeting_watcher::run(
-                &SHUTDOWN,
-                false,
-                (!preview_dictation).then_some(meeting_watcher::ListenerConfig {
+            let launch = if preview_dictation {
+                meeting_watcher::Launch::DictationHudPreview
+            } else {
+                meeting_watcher::Launch::App(meeting_watcher::ListenerConfig {
                     project_root: root,
                     event_path,
                     device,
-                }),
-                preview_dictation,
-            )
+                })
+            };
+            meeting_watcher::run(&SHUTDOWN, launch)
         }
         Command::Preview {
             target,
@@ -438,7 +438,10 @@ fn main() -> Result<()> {
             update_available,
         } => {
             if matches!(target, AppPreviewTarget::DictationHud) {
-                return meeting_watcher::run(&SHUTDOWN, false, None, true);
+                return meeting_watcher::run(
+                    &SHUTDOWN,
+                    meeting_watcher::Launch::DictationHudPreview,
+                );
             }
             if !transcription_models::LANGUAGES
                 .iter()
@@ -469,9 +472,9 @@ fn main() -> Result<()> {
                 AppPreviewModelState::Downloading => app_window::PreviewModelState::Downloading,
                 AppPreviewModelState::Error => app_window::PreviewModelState::Error,
             };
-            meeting_watcher::preview_shell(
+            meeting_watcher::run(
                 &SHUTDOWN,
-                app_window::AppWindowPreview {
+                meeting_watcher::Launch::Shell(app_window::AppWindowPreview {
                     pane,
                     transcription_picker: matches!(target, AppPreviewTarget::TranscriptionPicker)
                         .then_some((language, model_state)),
@@ -487,7 +490,7 @@ fn main() -> Result<()> {
                     open_history_retention,
                     confirm_release_microphone,
                     update_available,
-                },
+                }),
             )
         }
         Command::Listen { device } => {
@@ -630,7 +633,12 @@ fn main() -> Result<()> {
         #[cfg(debug_assertions)]
         Command::Meeting {
             command: MeetingCommand::Watch { preview },
-        } => meeting_watcher::run(&SHUTDOWN, preview, None, false),
+        } => meeting_watcher::run(
+            &SHUTDOWN,
+            meeting_watcher::Launch::MeetingWatch {
+                offer_preview: preview,
+            },
+        ),
         #[cfg(debug_assertions)]
         Command::Meeting {
             command: MeetingCommand::Probe,
