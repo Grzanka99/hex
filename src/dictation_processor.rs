@@ -595,17 +595,17 @@ fn discover_opencode_service_with(
         pid: u32,
         version: String,
     }
-    let mut endpoints = SERVICE_INFO_ENDPOINTS.iter();
-    let mut output = run(&["api", "get", endpoints.next().expect("endpoints")])?;
+    let (newest, older) = SERVICE_INFO_ENDPOINTS.split_first().expect("endpoints");
+    let mut output = run(&["api", "get", newest])?;
     // Older OpenCode versions expose the service info under an earlier name.
     // Only an exact CLI 404 diagnostic tries the next name; other failures are final.
-    while endpoint_is_missing(&output) {
-        let Some(endpoint) = endpoints.next() else {
+    for endpoint in older {
+        if !endpoint_is_missing(&output) {
             break;
-        };
+        }
         output = run(&["api", "get", endpoint])?;
     }
-    let health: ServiceInfo = serde_json::from_str(&decode(output)?)
+    let info: ServiceInfo = serde_json::from_str(&decode(output)?)
         .map_err(|_| eyre!("OpenCode returned an invalid service info response"))?;
     let paths = decode(run(&["debug", "paths"])?)?;
     let state = paths
@@ -616,7 +616,7 @@ fn discover_opencode_service_with(
         })
         .filter(|path| path.is_absolute())
         .ok_or_else(|| eyre!("OpenCode did not report its state directory"))?;
-    read_service_registration(state, health.pid, &health.version)
+    read_service_registration(state, info.pid, &info.version)
 }
 
 fn endpoint_is_missing(output: &CommandOutput) -> bool {

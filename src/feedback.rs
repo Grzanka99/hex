@@ -48,8 +48,10 @@ fn sounds_enabled() -> bool {
 
 /// How long the output device stays open after the last tone finishes. Holding
 /// the default output open keeps macOS from idle-sleeping, so an idle app must
-/// release it; a short grace keeps the start/stop pair of one dictation warm.
-const IDLE_RELEASE_GRACE: Duration = Duration::from_secs(30);
+/// release it. A tone implies recent user activity, so a grace shorter than any
+/// idle-sleep timer costs nothing while sparing bursts of dictation the cold
+/// device reopen.
+const IDLE_RELEASE_GRACE: Duration = Duration::from_secs(5 * 60);
 const OPEN_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 // Only the playback worker owns a device. It opens lazily for a tone, stays
@@ -81,10 +83,7 @@ impl<S> FeedbackOutput<S> {
 
     fn mark_playing(&mut self, now: Instant, duration: Duration) {
         let until = now + duration;
-        self.playing_until = Some(
-            self.playing_until
-                .map_or(until, |current| current.max(until)),
-        );
+        self.playing_until = Some(self.playing_until.unwrap_or(until).max(until));
     }
 
     /// Releases the device when sounds are off or nothing has played within the
@@ -174,8 +173,9 @@ pub fn preload() -> Result<()> {
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            output.release_when_idle(sounds_enabled(), Instant::now());
-            let Some(tone) = tone else {
+            let enabled = sounds_enabled();
+            output.release_when_idle(enabled, Instant::now());
+            let Some(tone) = tone.filter(|_| enabled) else {
                 continue;
             };
             let sound = match tone {
@@ -185,9 +185,6 @@ pub fn preload() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 Tone::Wake | Tone::Sleep | Tone::Error => continue,
             };
-            if !sounds_enabled() {
-                continue;
-            }
             if let Err(error) = output.open_for_tone(Instant::now(), open) {
                 tracing::warn!(%error, "recording audio output unavailable; retrying");
             }

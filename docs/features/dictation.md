@@ -216,7 +216,7 @@ Record -> Release -> Transcribing/processing/paste -> Finished // dictate.feedba
   HUD + tones distinguish capture from pending work          // never take focus
   Pending processing/paste -> Still unfinished, not recording
   Tone requested -> Playback worker opens the default output, then plays
-     -> Output stays open 30 s past the last tone, then releases
+     -> Output stays open five minutes past the last tone, then releases
      -> Released output holds no macOS idle-sleep assertion
   Feedback volume = 0 -> No tones
      -> Playback worker releases output on its next 250 ms observation
@@ -233,15 +233,16 @@ of the session. Linux already logged and continued; the macOS worker now
 matches that behavior instead of stopping desktop recognition.
 
 The playback worker never opens the output at startup. It opens the default
-output for the first tone, keeps it through a thirty-second idle grace so one
-dictation's start and stop tones share a warm device, and releases it after
-that grace or on the next observation after sounds turn Off. A device open
-already in progress must return before the worker can observe that change.
-Output-open failures retry at most once per two seconds, and a released device
-reopens without that backoff. Bundled samples remain decoded in memory. A
-tone that arrives after the grace pays a cold device open first; the tone is
-delayed, not clipped or dropped. Overlapping tones extend the playing window
-rather than shortening it.
+output for the first tone, keeps it through a five-minute idle grace so bursts
+of dictation share a warm device, and releases it after that grace or on the
+next observation after sounds turn Off. macOS idle-sleep timers count from the
+last user input, and a tone implies recent input, so the grace never delays
+sleep by itself. A device open already in progress must return before the
+worker can observe that change. Output-open failures retry at most once per
+two seconds, and a released device reopens without that backoff. Bundled
+samples remain decoded in memory. A tone that arrives after the grace pays a
+cold device open first; the tone is delayed, not clipped or dropped.
+Overlapping tones extend the playing window rather than shortening it.
 
 **Fixed after 2.1.20:** through 2.1.20 the worker opened the output at startup
 and kept it open for as long as sounds were On, so `coreaudiod` held a

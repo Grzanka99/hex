@@ -114,7 +114,7 @@ fn microphone_picker_menu(
     selected: Option<String>,
     error: Option<String>,
     choose: impl Fn(&Option<String>, &mut Window, &mut App) + 'static,
-    dismiss: impl Fn(&(), &mut Window, &mut App) + 'static,
+    dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<Div> {
     let choose = Rc::new(choose);
     div()
@@ -133,7 +133,7 @@ fn microphone_picker_menu(
         .bg(rgb(SURFACE))
         .shadow_lg()
         .occlude()
-        .on_mouse_down_out(move |_, window, cx| dismiss(&(), window, cx))
+        .on_mouse_down_out(dismiss)
         .children(choices.into_iter().enumerate().map(|(index, device)| {
             let is_selected = selected == device;
             let label = device.clone().unwrap_or_else(|| "Automatic".into());
@@ -3201,7 +3201,7 @@ impl AppWindow {
                 this.microphone_picker_error = None;
                 this.save_settings(cx);
             }),
-            cx.listener(|this, _: &(), _, cx| {
+            cx.listener(|this, _, _, cx| {
                 this.microphone_picker_open = false;
                 this.microphone_picker_error = None;
                 cx.notify();
