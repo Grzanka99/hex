@@ -27,15 +27,22 @@ HEX discovers `opencode2` and its managed service through
 [dictation_processor.rs](../../src/dictation_processor.rs), not a separate
 HEX-owned provider service.
 
-Discovery uses `opencode2 api get /api/status`; an exact CLI 404 falls back to
-`/api/health` for older V2 services. Both attempts share the original deadline
-and cancellation flag. Authentication, server, and malformed-response failures
-do not trigger that fallback, and discovery output is excluded from errors.
-`service_discovery_supports_current_and_legacy_endpoints` and
-`service_discovery_fallback_shares_deadline_and_observes_cancellation` cover
+Discovery uses `opencode2 api get /api/info`; an exact CLI 404 falls back to
+`/api/status`, then `/api/health`, for older V2 services. All attempts share the
+original deadline and cancellation flag. Authentication, server, and
+malformed-response failures do not trigger that fallback, and discovery output
+is excluded from errors. `service_discovery_supports_current_and_legacy_endpoints`
+and `service_discovery_fallback_shares_deadline_and_observes_cancellation` cover
 these routes with executable fixtures. This shared discovery also serves Modes.
-The local service on September 14 still exposes the legacy endpoint; current
-endpoint compatibility is fixture coverage, not an observed live-provider run.
+
+**Fixed after 2.1.20:** releases 2.1.18 through 2.1.20 only tried
+`/api/status` and `/api/health`. OpenCode `0.0.0-dev-19726` and later serve
+only `/api/info`, so those releases report `OpenCode service discovery failed
+(exit status: 1)` and Modes fall back to the corrected transcript
+([#98](https://github.com/anomalyco/hex/issues/98)). On September 22, 2026 the
+ignored `live_catalog` test discovered the running `0.0.0-dev-19937` service
+through `/api/info` and loaded its catalog; the legacy names returned exactly
+`HTTP 404 Not Found` from the CLI.
 
 ## Sub-features
 

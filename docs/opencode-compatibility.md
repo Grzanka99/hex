@@ -28,8 +28,10 @@ HEX discovers a separately installed `opencode2`, optionally overridden by
 managed service, or restart or update it. `opencode2 api` discovers or starts
 the service through OpenCode's own lifecycle.
 
-Catalog loading and generation use `opencode2 api get /api/health` to identify
-the authenticated active server, starting it through the CLI when needed.
+Catalog loading and generation use `opencode2 api get /api/info` to identify
+the authenticated active server, starting it through the CLI when needed. An
+exact CLI `HTTP 404 Not Found` falls back to the older `/api/status`, then
+`/api/health`, names within the same deadline; any other failure is final.
 `opencode2 debug paths` locates its state directory. HEX reads endpoint and
 password together from the bounded, owner-only service registration matching
 that server's PID and version.
@@ -66,7 +68,7 @@ published to npm's `dev` tag; `next` was an older beta, not the newest V2 build.
 Resolve the published version rather than assuming a moving tag identifies the
 desired source commit.
 
-Check the connected server's `/api/health` version as well as the CLI version:
+Check the connected server's `/api/info` version as well as the CLI version:
 the CLI's `api` command permits a server version mismatch. Do not replace a
 user's running service to perform compatibility validation.
 

@@ -19,6 +19,8 @@ use crate::text_replacements::ReplacementSet;
 const PROTOCOL_PROMPT: &str = "You transform dictated speech into replacement text. Return only the text that should be pasted. Do not add an explanation, label, alternative, or Markdown fence.";
 const VOICE_ACTION_PROTOCOL_PROMPT: &str = "You execute a one-off voice instruction. When selected text is provided, transform or use it as instructed. When no text is selected, generate the requested text. Return only the exact paste-ready result without an explanation, label, alternative, or Markdown fence.";
 const MAX_OPENCODE_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Newest service info route first; older OpenCode V2 builds only serve the later names.
+const SERVICE_INFO_ENDPOINTS: [&str; 3] = ["/api/info", "/api/status", "/api/health"];
 
 #[derive(Clone)]
 pub struct Profile {
@@ -589,19 +591,22 @@ fn discover_opencode_service_with(
         Ok(value)
     };
     #[derive(Deserialize)]
-    struct Health {
+    struct ServiceInfo {
         pid: u32,
         version: String,
     }
-    let mut output = run(&["api", "get", "/api/status"])?;
-    // Older OpenCode versions expose only /api/health. Other failures are not retries.
-    if !output.status.success()
-        && String::from_utf8_lossy(&output.stderr).trim() == "HTTP 404 Not Found"
-    {
-        output = run(&["api", "get", "/api/health"])?;
+    let mut endpoints = SERVICE_INFO_ENDPOINTS.iter();
+    let mut output = run(&["api", "get", endpoints.next().expect("endpoints")])?;
+    // Older OpenCode versions expose the service info under an earlier name.
+    // Only an exact CLI 404 diagnostic tries the next name; other failures are final.
+    while endpoint_is_missing(&output) {
+        let Some(endpoint) = endpoints.next() else {
+            break;
+        };
+        output = run(&["api", "get", endpoint])?;
     }
-    let health: Health = serde_json::from_str(&decode(output)?)
-        .map_err(|_| eyre!("OpenCode returned an invalid service health response"))?;
+    let health: ServiceInfo = serde_json::from_str(&decode(output)?)
+        .map_err(|_| eyre!("OpenCode returned an invalid service info response"))?;
     let paths = decode(run(&["debug", "paths"])?)?;
     let state = paths
         .lines()
@@ -612,6 +617,11 @@ fn discover_opencode_service_with(
         .filter(|path| path.is_absolute())
         .ok_or_else(|| eyre!("OpenCode did not report its state directory"))?;
     read_service_registration(state, health.pid, &health.version)
+}
+
+fn endpoint_is_missing(output: &CommandOutput) -> bool {
+    !output.status.success()
+        && String::from_utf8_lossy(&output.stderr).trim() == "HTTP 404 Not Found"
 }
 
 fn read_service_registration(state: &Path, pid: u32, version: &str) -> Result<(String, String)> {
@@ -1560,54 +1570,77 @@ mod tests {
         .unwrap();
         fs::set_permissions(&registration, fs::Permissions::from_mode(0o600)).unwrap();
         let executable = root.join("opencode2");
-        for (status, health, succeeds, expected_calls) in [
+        const INFO: &str = "printf '%s\\n' '{\"pid\":42,\"version\":\"fixture-version\"}'";
+        const MISSING: &str = "echo 'HTTP 404 Not Found' >&2; exit 1";
+        for (info, status, health, succeeds, expected_calls) in [
             (
-                "printf '%s\\n' '{\"pid\":42,\"version\":\"fixture-version\"}'",
-                "echo 'HTTP 404 Not Found' >&2; exit 1",
+                INFO,
+                MISSING,
+                MISSING,
                 true,
-                "api get /api/status\ndebug paths\n",
+                "api get /api/info\ndebug paths\n",
             ),
             (
-                "echo 'HTTP 404 Not Found' >&2; exit 1",
-                "printf '%s\\n' '{\"pid\":42,\"version\":\"fixture-version\"}'",
+                MISSING,
+                INFO,
+                MISSING,
                 true,
-                "api get /api/status\napi get /api/health\ndebug paths\n",
+                "api get /api/info\napi get /api/status\ndebug paths\n",
+            ),
+            (
+                MISSING,
+                MISSING,
+                INFO,
+                true,
+                "api get /api/info\napi get /api/status\napi get /api/health\ndebug paths\n",
             ),
             (
                 "echo 'HTTP 401 Unauthorized' >&2; exit 1",
-                "exit 0",
+                INFO,
+                INFO,
                 false,
-                "api get /api/status\n",
+                "api get /api/info\n",
             ),
             (
                 "echo 'HTTP 500 Internal Server Error' >&2; exit 1",
-                "exit 0",
+                INFO,
+                INFO,
                 false,
-                "api get /api/status\n",
+                "api get /api/info\n",
             ),
             (
                 "echo 'private diagnostic mentioning HTTP 404 Not Found' >&2; exit 1",
-                "exit 0",
+                INFO,
+                INFO,
                 false,
-                "api get /api/status\n",
+                "api get /api/info\n",
             ),
             (
                 "echo 'private invalid response'",
-                "exit 0",
+                INFO,
+                INFO,
                 false,
-                "api get /api/status\n",
+                "api get /api/info\n",
             ),
             (
-                "echo 'HTTP 404 Not Found' >&2; exit 1",
+                MISSING,
                 "echo 'private diagnostic' >&2; exit 1",
+                INFO,
                 false,
-                "api get /api/status\napi get /api/health\n",
+                "api get /api/info\napi get /api/status\n",
+            ),
+            (
+                MISSING,
+                MISSING,
+                MISSING,
+                false,
+                "api get /api/info\napi get /api/status\napi get /api/health\n",
             ),
         ] {
             fs::write(
                 &executable,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls\ncase \"$*\" in\n'api get /api/status') {status} ;;\n'api get /api/health') {health} ;;\n'debug paths') printf 'state %s\\n' \"$PWD\" ;;\n*) exit 2 ;;\nesac\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls\ncase \"$*\" in\n'api get /api/info') {info} ;;\n'api get /api/status') {status} ;;\n'api get /api/health') {health} ;;\n'debug paths') printf 'state %s\\n' \"$PWD\" ;;\n*) exit 2 ;;\nesac\n"
                 ),
             )
             .unwrap();
@@ -1622,7 +1655,7 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(root.join("calls")).unwrap(),
                 expected_calls,
-                "status fixture: {status}"
+                "fixtures: {info} / {status} / {health}"
             );
             if succeeds {
                 assert_eq!(
@@ -1650,7 +1683,7 @@ mod tests {
         let executable = root.join("opencode2");
         fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls\nsleep 2\ncase \"$*\" in\n'api get /api/status') echo 'HTTP 404 Not Found' >&2; exit 1 ;;\n'api get /api/health') echo '{\"pid\":42,\"version\":\"fixture-version\"}' ;;\n*) exit 2 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls\ncase \"$*\" in\n'api get /api/info') echo 'HTTP 404 Not Found' >&2; exit 1 ;;\n'api get /api/status') sleep 2; echo 'HTTP 404 Not Found' >&2; exit 1 ;;\n'api get /api/health') sleep 2; echo '{\"pid\":42,\"version\":\"fixture-version\"}' ;;\n*) exit 2 ;;\nesac\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1664,7 +1697,7 @@ mod tests {
         assert!(error.to_string().contains("exceeded"), "{error}");
         assert_eq!(
             fs::read_to_string(root.join("calls")).unwrap(),
-            "api get /api/status\napi get /api/health\n"
+            "api get /api/info\napi get /api/status\napi get /api/health\n"
         );
         fs::remove_file(root.join("calls")).unwrap();
         let error = discover_opencode_service_with(
