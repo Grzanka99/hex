@@ -2164,15 +2164,7 @@ fn handle_dictation_event(
                 TranscriptionTarget::Paste | TranscriptionTarget::Send => DictationPhase::Pasted,
                 TranscriptionTarget::Service => return Ok(()),
             };
-            events.processed_dictation(
-                phase,
-                text,
-                processing.map(|processing| DictationProcessing {
-                    profile: processing.profile,
-                    latency_ms: processing.latency_ms,
-                    fallback: processing.fallback,
-                }),
-            )?;
+            events.processed_dictation(phase, text, processing.map(DictationProcessing::from))?;
             if let Some(indicator) = indicator {
                 indicator.send(DictationIndicatorEvent::JobCompleted {
                     job_id: job_id.value(),

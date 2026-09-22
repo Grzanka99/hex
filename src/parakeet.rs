@@ -21,8 +21,6 @@ use crate::history::{History, HistoryDraft, HistoryKind};
 use crate::meeting::{self, TranscriptEntry, TranscriptPublication};
 use crate::paste::{PasteMode, Paster};
 use crate::suppression::InputActivity;
-#[cfg(test)]
-use crate::text_replacements::ReplacementSet;
 use crate::transcription::{Transcriber, WarmTranscriber};
 use crate::transcription_models::{
     TranscriptionModelId, TranscriptionSelection, model_path, validate,
@@ -112,6 +110,12 @@ struct ProcessorJob {
     target: TranscriptionTarget,
     text: String,
     context: ContextSnapshot,
+    timings: JobTimings,
+}
+
+/// Pipeline timings carried from inference through output for the final log.
+#[derive(Clone, Copy)]
+struct JobTimings {
     total_started: Instant,
     queue_ms: u128,
     audio_ms: u64,
@@ -124,11 +128,7 @@ struct CompletedTranscript {
     /// Corrected local transcript before mode processing.
     raw: String,
     application: Option<String>,
-    total_started: Instant,
-    queue_ms: u128,
-    audio_ms: u64,
-    prepare_ms: u128,
-    inference_ms: u128,
+    timings: JobTimings,
     processing: Option<ProcessingObservation>,
 }
 
@@ -265,300 +265,29 @@ impl DictationWorker {
             pending_pastes: 0,
         }));
 
-        let output_state = state.clone();
-        let output_events = event_sender.clone();
-        let output_worker = thread::spawn(move || {
-            let mut paster = Paster::new(activity);
-            let mut last_transcript = None;
-            let mut meeting_cursor = MeetingPasteCursor::default();
-            let mut ordered = OrderedOutputs::default();
-            while let Ok(job) = output_receiver.recv() {
-                if matches!(job, OutputJob::PreparePaste) {
-                    paster.prepare();
-                    continue;
-                }
-                for job in ordered.push(job) {
-                    let event = finish_output(
-                        job,
-                        &mut |text, mode, commit| paster.paste(text, mode, commit),
-                        &mut last_transcript,
-                        &mut meeting_cursor,
-                        history.as_ref(),
-                    );
-                    let mut state = output_state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    match &event {
-                        WorkerEvent::Completed { job_id, .. }
-                        | WorkerEvent::Cancelled { job_id } => {
-                            state.jobs.remove(job_id);
-                        }
-                        WorkerEvent::Pasted { .. } => {
-                            state.pending_pastes = state.pending_pastes.saturating_sub(1);
-                        }
-                        WorkerEvent::ModelFailed(_) | WorkerEvent::Stage { .. } => {}
-                    }
-                    drop(state);
-                    if output_events.send(event).is_err() {
-                        return;
-                    }
-                }
-            }
+        let output_worker = thread::spawn({
+            let state = state.clone();
+            let events = event_sender.clone();
+            move || run_output_worker(output_receiver, activity, history, &state, &events)
         });
 
         let processor_receiver = Arc::new(Mutex::new(processor_receiver));
-        let mut processor_workers = Vec::with_capacity(PROCESSOR_WORKERS);
-        for _ in 0..PROCESSOR_WORKERS {
-            let processor_receiver = processor_receiver.clone();
-            let processor_output = output_jobs.clone();
-            let processor_events = event_sender.clone();
-            let transformations = transformations.clone();
-            processor_workers.push(thread::spawn(move || {
-                loop {
-                    let job = {
-                        processor_receiver
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .recv()
-                    };
-                    let Ok(job) = job else { break };
-                    if job.control.is_cancelled() {
-                        let _ = processor_output.send(OutputJob::Cancelled { job_id: job.job_id });
-                        continue;
-                    }
-                    let profiles = crate::config::dictation_profiles();
-                    if matches!(job.target, TranscriptionTarget::VoiceAction)
-                        || profiles.processes(&job.context)
-                    {
-                        let _ = processor_events.send(WorkerEvent::Stage {
-                            job_id: job.job_id,
-                            stage: DictationJobStage::Processing,
-                        });
-                    }
-                    let mut processed = if matches!(job.target, TranscriptionTarget::VoiceAction) {
-                        profiles.process_voice_action_cancellable(
-                            &job.text,
-                            job.context.selected_text.as_deref(),
-                            &job.context,
-                            &job.control.cancelled,
-                        )
-                    } else {
-                        profiles.process_cancellable(
-                            &job.text,
-                            &job.context,
-                            &job.control.cancelled,
-                        )
-                    };
-                    if !processed.transformations.is_empty() && !job.control.is_cancelled() {
-                        let started = Instant::now();
-                        match transformations.transform(
-                            &processed.transformations,
-                            &processed.text,
-                            &job.context,
-                            &job.control.cancelled,
-                        ) {
-                            Ok(text) => {
-                                processed.text = text;
-                                let observation = processed.observation.get_or_insert_with(|| {
-                                    ProcessingObservation {
-                                        profile: "Custom transformations".into(),
-                                        latency_ms: 0,
-                                        fallback: None,
-                                    }
-                                });
-                                observation.latency_ms = observation
-                                    .latency_ms
-                                    .saturating_add(started.elapsed().as_millis() as u64);
-                            }
-                            Err(error) => {
-                                let observation = processed.observation.get_or_insert_with(|| {
-                                    ProcessingObservation {
-                                        profile: "Custom transformations".into(),
-                                        latency_ms: 0,
-                                        fallback: None,
-                                    }
-                                });
-                                observation.latency_ms = observation
-                                    .latency_ms
-                                    .saturating_add(started.elapsed().as_millis() as u64);
-                                observation.fallback = Some(error);
-                            }
-                        }
-                    }
-                    if job.control.is_cancelled() {
-                        let _ = processor_output.send(OutputJob::Cancelled { job_id: job.job_id });
-                        continue;
-                    }
-                    if let Some(observation) = &processed.observation
-                        && let Some(error) = &observation.fallback
-                    {
-                        if matches!(job.target, TranscriptionTarget::VoiceAction) {
-                            tracing::warn!(%error, "voice action processing failed");
-                        } else {
-                            tracing::warn!(
-                                profile = observation.profile,
-                                %error,
-                                "dictation processing fell back to the previous pipeline output"
-                            );
-                        }
-                    }
-                    if processor_output
-                        .send(OutputJob::Completed {
-                            job_id: job.job_id,
-                            control: job.control,
-                            target: job.target,
-                            result: Box::new(Ok(CompletedTranscript {
-                                text: processed.text,
-                                raw: job.text,
-                                application: job.context.application,
-                                total_started: job.total_started,
-                                queue_ms: job.queue_ms,
-                                audio_ms: job.audio_ms,
-                                prepare_ms: job.prepare_ms,
-                                inference_ms: job.inference_ms,
-                                processing: processed.observation,
-                            })),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
-        }
-
-        let inference_events = event_sender.clone();
-        let inference_output = output_jobs.clone();
-        let inference_worker = thread::spawn(move || {
-            prioritize_inference_thread();
-            let mut transcriber = match WarmTranscriber::load() {
-                Ok(transcriber) => {
-                    tracing::info!("transcription model loaded");
-                    transcriber
-                }
-                Err(error) => {
-                    let _ = inference_events.send(WorkerEvent::ModelFailed(error.to_string()));
-                    WarmTranscriber::default()
-                }
-            };
-            while let Ok(command) = inference_receiver.recv() {
-                let job = match command {
-                    InferenceCommand::Reload(selection) => {
-                        if let Err(error) = transcriber.activate(&selection) {
-                            let _ =
-                                inference_events.send(WorkerEvent::ModelFailed(error.to_string()));
-                        }
-                        continue;
-                    }
-                    InferenceCommand::Transcribe(job) => *job,
-                };
-                if job.control.is_cancelled() {
-                    let _ = inference_output.send(OutputJob::Cancelled { job_id: job.job_id });
-                    continue;
-                }
-                let _ = inference_events.send(WorkerEvent::Stage {
-                    job_id: job.job_id,
-                    stage: DictationJobStage::Transcribing,
-                });
-                let transcriber = match transcriber.activate(&job.selection) {
-                    Ok(transcriber) => transcriber,
-                    Err(error) => {
-                        let _ = inference_output.send(OutputJob::Completed {
-                            job_id: job.job_id,
-                            control: job.control,
-                            target: job.target,
-                            result: Box::new(Err(error.to_string())),
-                        });
-                        continue;
-                    }
-                };
-                let total_started = job.submitted_at;
-                let queue_ms = total_started.elapsed().as_millis();
-                let audio_ms = job.clip.duration_ms();
-                let prepare_started = Instant::now();
-                let clip_samples = job.clip.into_transcription_samples();
-                crate::dictation_diagnostics::persist(&clip_samples);
-                let samples = transcriber.prepare_samples(clip_samples);
-                let prepare_ms = prepare_started.elapsed().as_millis();
-                let inference_started = Instant::now();
-                let result = match (transcriber, job.protocol.as_deref()) {
-                    (Transcriber::Gguf(model), Some(protocol)) => {
-                        model.transcribe_voice(&samples, protocol)
-                    }
-                    (transcriber, _) => transcriber.transcribe(&samples),
-                }
-                .map(|text| {
-                    let corrected = if matches!(job.target, TranscriptionTarget::Service) {
-                        text.clone()
-                    } else {
-                        prepare_transcript(&text, job.protocol.as_deref())
-                    };
-                    tracing::debug!(
-                        raw_transcript = text,
-                        corrected_transcript = corrected,
-                        "prepared local transcript"
-                    );
-                    corrected
+        let processor_workers = (0..PROCESSOR_WORKERS)
+            .map(|_| {
+                let jobs = processor_receiver.clone();
+                let output = output_jobs.clone();
+                let events = event_sender.clone();
+                let transformations = transformations.clone();
+                thread::spawn(move || {
+                    run_processor_worker(&jobs, &output, &events, &transformations)
                 })
-                .map_err(|error| error.to_string());
-                let inference_ms = inference_started.elapsed().as_millis();
-                if job.control.is_cancelled() {
-                    let _ = inference_output.send(OutputJob::Cancelled { job_id: job.job_id });
-                    continue;
-                }
-                match result {
-                    Ok(text)
-                        if matches!(
-                            job.target,
-                            TranscriptionTarget::Paste
-                                | TranscriptionTarget::Send
-                                | TranscriptionTarget::VoiceAction
-                        ) && !text.trim().is_empty() =>
-                    {
-                        if processor_jobs
-                            .send(ProcessorJob {
-                                job_id: job.job_id,
-                                control: job.control,
-                                target: job.target,
-                                text,
-                                context: job.context,
-                                total_started,
-                                queue_ms,
-                                audio_ms,
-                                prepare_ms,
-                                inference_ms,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    result => {
-                        let application = job.context.application;
-                        let result = result.map(|text| CompletedTranscript {
-                            raw: text.clone(),
-                            text,
-                            application,
-                            total_started,
-                            queue_ms,
-                            audio_ms,
-                            prepare_ms,
-                            inference_ms,
-                            processing: None,
-                        });
-                        if inference_output
-                            .send(OutputJob::Completed {
-                                job_id: job.job_id,
-                                control: job.control,
-                                target: job.target,
-                                result: Box::new(result),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
+            })
+            .collect();
+
+        let inference_worker = thread::spawn({
+            let output = output_jobs.clone();
+            move || {
+                run_inference_worker(inference_receiver, &processor_jobs, &output, &event_sender)
             }
         });
 
@@ -692,6 +421,278 @@ impl Drop for DictationWorker {
     }
 }
 
+fn run_output_worker(
+    jobs: Receiver<OutputJob>,
+    activity: InputActivity,
+    history: Option<History>,
+    state: &Mutex<WorkerState>,
+    events: &mpsc::Sender<WorkerEvent>,
+) {
+    let mut paster = Paster::new(activity);
+    let mut last_transcript = None;
+    let mut meeting_cursor = MeetingPasteCursor::default();
+    let mut ordered = OrderedOutputs::default();
+    while let Ok(job) = jobs.recv() {
+        if matches!(job, OutputJob::PreparePaste) {
+            paster.prepare();
+            continue;
+        }
+        for job in ordered.push(job) {
+            let event = finish_output(
+                job,
+                &mut |text, mode, commit| paster.paste(text, mode, commit),
+                &mut last_transcript,
+                &mut meeting_cursor,
+                history.as_ref(),
+            );
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            match &event {
+                WorkerEvent::Completed { job_id, .. } | WorkerEvent::Cancelled { job_id } => {
+                    state.jobs.remove(job_id);
+                }
+                WorkerEvent::Pasted { .. } => {
+                    state.pending_pastes = state.pending_pastes.saturating_sub(1);
+                }
+                WorkerEvent::ModelFailed(_) | WorkerEvent::Stage { .. } => {}
+            }
+            drop(state);
+            if events.send(event).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn run_processor_worker(
+    jobs: &Mutex<Receiver<ProcessorJob>>,
+    output: &SyncSender<OutputJob>,
+    events: &mpsc::Sender<WorkerEvent>,
+    transformations: &crate::personal_commands::TransformationClient,
+) {
+    loop {
+        let job = jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .recv();
+        let Ok(job) = job else { break };
+        if job.control.is_cancelled() {
+            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            continue;
+        }
+        let profiles = crate::config::dictation_profiles();
+        if matches!(job.target, TranscriptionTarget::VoiceAction)
+            || profiles.processes(&job.context)
+        {
+            let _ = events.send(WorkerEvent::Stage {
+                job_id: job.job_id,
+                stage: DictationJobStage::Processing,
+            });
+        }
+        let mut processed = if matches!(job.target, TranscriptionTarget::VoiceAction) {
+            profiles.process_voice_action_cancellable(
+                &job.text,
+                job.context.selected_text.as_deref(),
+                &job.context,
+                &job.control.cancelled,
+            )
+        } else {
+            profiles.process_cancellable(&job.text, &job.context, &job.control.cancelled)
+        };
+        if !processed.transformations.is_empty() && !job.control.is_cancelled() {
+            let started = Instant::now();
+            let transformed = transformations.transform(
+                &processed.transformations,
+                &processed.text,
+                &job.context,
+                &job.control.cancelled,
+            );
+            let observation = processed
+                .observation
+                .get_or_insert_with(|| ProcessingObservation {
+                    profile: "Custom transformations".into(),
+                    latency_ms: 0,
+                    fallback: None,
+                });
+            observation.latency_ms = observation
+                .latency_ms
+                .saturating_add(started.elapsed().as_millis() as u64);
+            match transformed {
+                Ok(text) => processed.text = text,
+                Err(error) => observation.fallback = Some(error),
+            }
+        }
+        if job.control.is_cancelled() {
+            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            continue;
+        }
+        if let Some(observation) = &processed.observation
+            && let Some(error) = &observation.fallback
+        {
+            if matches!(job.target, TranscriptionTarget::VoiceAction) {
+                tracing::warn!(%error, "voice action processing failed");
+            } else {
+                tracing::warn!(
+                    profile = observation.profile,
+                    %error,
+                    "dictation processing fell back to the previous pipeline output"
+                );
+            }
+        }
+        if output
+            .send(OutputJob::Completed {
+                job_id: job.job_id,
+                control: job.control,
+                target: job.target,
+                result: Box::new(Ok(CompletedTranscript {
+                    text: processed.text,
+                    raw: job.text,
+                    application: job.context.application,
+                    timings: job.timings,
+                    processing: processed.observation,
+                })),
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn run_inference_worker(
+    commands: Receiver<InferenceCommand>,
+    processor_jobs: &SyncSender<ProcessorJob>,
+    output: &SyncSender<OutputJob>,
+    events: &mpsc::Sender<WorkerEvent>,
+) {
+    prioritize_inference_thread();
+    let mut transcriber = match WarmTranscriber::load() {
+        Ok(transcriber) => {
+            tracing::info!("transcription model loaded");
+            transcriber
+        }
+        Err(error) => {
+            let _ = events.send(WorkerEvent::ModelFailed(error.to_string()));
+            WarmTranscriber::default()
+        }
+    };
+    while let Ok(command) = commands.recv() {
+        let job = match command {
+            InferenceCommand::Reload(selection) => {
+                if let Err(error) = transcriber.activate(&selection) {
+                    let _ = events.send(WorkerEvent::ModelFailed(error.to_string()));
+                }
+                continue;
+            }
+            InferenceCommand::Transcribe(job) => *job,
+        };
+        if job.control.is_cancelled() {
+            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            continue;
+        }
+        let _ = events.send(WorkerEvent::Stage {
+            job_id: job.job_id,
+            stage: DictationJobStage::Transcribing,
+        });
+        let transcriber = match transcriber.activate(&job.selection) {
+            Ok(transcriber) => transcriber,
+            Err(error) => {
+                let _ = output.send(OutputJob::Completed {
+                    job_id: job.job_id,
+                    control: job.control,
+                    target: job.target,
+                    result: Box::new(Err(error.to_string())),
+                });
+                continue;
+            }
+        };
+        let total_started = job.submitted_at;
+        let queue_ms = total_started.elapsed().as_millis();
+        let audio_ms = job.clip.duration_ms();
+        let prepare_started = Instant::now();
+        let clip_samples = job.clip.into_transcription_samples();
+        crate::dictation_diagnostics::persist(&clip_samples);
+        let samples = transcriber.prepare_samples(clip_samples);
+        let prepare_ms = prepare_started.elapsed().as_millis();
+        let inference_started = Instant::now();
+        let result = match (transcriber, job.protocol.as_deref()) {
+            (Transcriber::Gguf(model), Some(protocol)) => {
+                model.transcribe_voice(&samples, protocol)
+            }
+            (transcriber, _) => transcriber.transcribe(&samples),
+        }
+        .map(|text| {
+            let corrected = if matches!(job.target, TranscriptionTarget::Service) {
+                text.clone()
+            } else {
+                strip_transcript_protocol(&text, job.protocol.as_deref())
+            };
+            tracing::debug!(
+                raw_transcript = text,
+                corrected_transcript = corrected,
+                "prepared local transcript"
+            );
+            corrected
+        })
+        .map_err(|error| error.to_string());
+        let timings = JobTimings {
+            total_started,
+            queue_ms,
+            audio_ms,
+            prepare_ms,
+            inference_ms: inference_started.elapsed().as_millis(),
+        };
+        if job.control.is_cancelled() {
+            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            continue;
+        }
+        match result {
+            Ok(text)
+                if matches!(
+                    job.target,
+                    TranscriptionTarget::Paste
+                        | TranscriptionTarget::Send
+                        | TranscriptionTarget::VoiceAction
+                ) && !text.trim().is_empty() =>
+            {
+                if processor_jobs
+                    .send(ProcessorJob {
+                        job_id: job.job_id,
+                        control: job.control,
+                        target: job.target,
+                        text,
+                        context: job.context,
+                        timings,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            result => {
+                let application = job.context.application;
+                let result = result.map(|text| CompletedTranscript {
+                    raw: text.clone(),
+                    text,
+                    application,
+                    timings,
+                    processing: None,
+                });
+                if output
+                    .send(OutputJob::Completed {
+                        job_id: job.job_id,
+                        control: job.control,
+                        target: job.target,
+                        result: Box::new(result),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn join_worker(worker: Option<thread::JoinHandle<()>>, name: &str) {
     if let Some(worker) = worker
         && worker.join().is_err()
@@ -787,12 +788,12 @@ fn finish_output(
                     }
                 }
                 tracing::info!(
-                    audio_ms = completed.audio_ms,
-                    queue_ms = completed.queue_ms,
-                    prepare_ms = completed.prepare_ms,
-                    inference_ms = completed.inference_ms,
+                    audio_ms = completed.timings.audio_ms,
+                    queue_ms = completed.timings.queue_ms,
+                    prepare_ms = completed.timings.prepare_ms,
+                    inference_ms = completed.timings.inference_ms,
                     paste_ms = paste_started.elapsed().as_millis(),
-                    total_ms = completed.total_started.elapsed().as_millis(),
+                    total_ms = completed.timings.total_started.elapsed().as_millis(),
                     "dictation pipeline completed"
                 );
                 Ok(completed.text)
@@ -844,33 +845,14 @@ fn record_history(history: &History, target: TranscriptionTarget, completed: &Co
         raw_text: completed.raw.clone(),
         final_text: completed.text.clone(),
         application: completed.application.clone(),
-        processing: completed.processing.as_ref().map(|processing| {
-            crate::history::HistoryProcessing {
-                profile: processing.profile.clone(),
-                latency_ms: processing.latency_ms,
-                fallback: processing.fallback.clone(),
-            }
-        }),
-        audio_ms: completed.audio_ms,
-        inference_ms: completed.inference_ms as u64,
-        total_ms: completed.total_started.elapsed().as_millis() as u64,
+        processing: completed.processing.clone().map(Into::into),
+        audio_ms: completed.timings.audio_ms,
+        inference_ms: completed.timings.inference_ms as u64,
+        total_ms: completed.timings.total_started.elapsed().as_millis() as u64,
     };
     if let Err(error) = history.record(draft) {
         tracing::warn!(%error, "could not record dictation history");
     }
-}
-
-fn prepare_transcript(text: &str, protocol: Option<&DictationProtocol>) -> String {
-    strip_transcript_protocol(text, protocol)
-}
-
-#[cfg(test)]
-fn prepare_transcript_with(
-    text: &str,
-    protocol: Option<&DictationProtocol>,
-    replacements: &ReplacementSet,
-) -> String {
-    replacements.replace(&strip_transcript_protocol(text, protocol))
 }
 
 fn strip_transcript_protocol(text: &str, protocol: Option<&DictationProtocol>) -> String {
@@ -1181,7 +1163,6 @@ mod tests {
 
     use super::*;
 
-    use crate::app_settings::TextReplacement;
     use crate::dictation::resample_for_parakeet;
     use crate::meeting::MeetingSource;
 
@@ -1234,33 +1215,18 @@ mod tests {
     }
 
     #[test]
-    fn replacements_follow_control_stripping_and_stay_corrected_through_fallback() {
-        let replacements = ReplacementSet::new(&[
-            TextReplacement {
-                matched_phrase: "open code".into(),
-                output: "OpenCode".into(),
-            },
-            TextReplacement {
-                matched_phrase: "alpha".into(),
-                output: "beta".into(),
-            },
-            TextReplacement {
-                matched_phrase: "beta".into(),
-                output: "gamma".into(),
-            },
-        ]);
-
+    fn protocol_stripping_removes_control_phrases_without_a_protocol_fallback() {
         let protocol = DictationProtocol::default();
-        let corrected = prepare_transcript_with(
-            "Dictate start, use open code and alpha. Dictate stop.",
-            Some(&protocol),
-            &replacements,
-        );
-
-        assert_eq!(corrected, "Use OpenCode and beta.");
         assert_eq!(
-            prepare_transcript_with("Dictate start, alpha. Dictate stop.", None, &replacements),
-            "Dictate start, beta. Dictate stop."
+            strip_transcript_protocol(
+                "Dictate start, use open code and alpha. Dictate stop.",
+                Some(&protocol),
+            ),
+            "Use open code and alpha."
+        );
+        assert_eq!(
+            strip_transcript_protocol("Dictate start, alpha. Dictate stop.", None),
+            "Dictate start, alpha. Dictate stop."
         );
         let custom_protocol = DictationProtocol::try_new(
             vec!["begin note".into()],
@@ -1270,15 +1236,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            prepare_transcript_with(
-                "Begin note, alpha. Finish note.",
-                Some(&custom_protocol),
-                &replacements,
-            ),
-            "beta."
+            strip_transcript_protocol("Begin note, alpha. Finish note.", Some(&custom_protocol)),
+            "Alpha."
         );
-        assert_eq!(replacements.replace("beta"), "gamma");
-        assert_eq!(replacements.replace("Use OPEN CODE."), "Use OpenCode.");
     }
 
     #[test]
@@ -1442,11 +1402,13 @@ mod tests {
             text: text.into(),
             raw: text.into(),
             application: None,
-            total_started: Instant::now(),
-            queue_ms: 0,
-            audio_ms: 1_000,
-            prepare_ms: 0,
-            inference_ms: 0,
+            timings: JobTimings {
+                total_started: Instant::now(),
+                queue_ms: 0,
+                audio_ms: 1_000,
+                prepare_ms: 0,
+                inference_ms: 0,
+            },
             processing: None,
         };
         for target in [
@@ -1636,7 +1598,7 @@ mod tests {
             );
 
             let clipped = model.transcribe_voice(&samples, &protocol).unwrap();
-            let prepared = prepare_transcript(&clipped, Some(&protocol));
+            let prepared = strip_transcript_protocol(&clipped, Some(&protocol));
             println!("  clipped: {:?} -> {:?}", clipped, prepared);
             assert_eq!(prepared, expected);
         }
