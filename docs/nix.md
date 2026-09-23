@@ -1,11 +1,13 @@
 # Nix
 
 The flake packages HEX for `x86_64-linux`. It supports the Linux X11 beta
-and native Wayland on compatible wlroots compositors. Wayland requires
-layer-shell for the recording overlay, the clipboard protocol used by
-`wl-copy`, the virtual-keyboard protocol used by `wtype`, and read access to
-every `/dev/input/event*` device for global hotkeys. This is not a claim of support
-for every Wayland desktop; GNOME and KDE are not covered by this contract.
+and native Wayland on compatible compositors such as Hyprland and Sway.
+Wayland requires the clipboard protocol used by `wl-copy` and read access to
+every `/dev/input/event*` device for global hotkeys. Hyprland and Sway use
+`wtype`'s virtual-keyboard protocol; KDE and GNOME use a keyboard-only
+RemoteDesktop portal permission and libei for paste. KDE paste was confirmed
+on a physical desktop; GNOME remains unverified. The recording overlay needs
+layer-shell, which GNOME does not provide.
 
 ## Run Or Install
 
@@ -118,7 +120,8 @@ Wayland shortcuts use physical evdev key positions and US-style key labels,
 not the current layout's characters. HEX observes the keys but does not
 suppress them. The compositor or focused app can still act on the chord;
 use an appropriate compositor binding if you need to reserve it. The paste
-helper is `wtype`; no privileged input-injection fallback is installed.
+helper is `wtype` on compatible compositors and portal-authorized libei on
+KDE/GNOME; no privileged input-injection fallback is installed.
 
 ## Development
 

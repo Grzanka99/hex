@@ -16,6 +16,7 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::linux_input::Keymap;
 use crate::linux_input::WaylandModifierState;
+use crate::linux_portal_paste::{self, PortalKeyboard};
 use crate::linux_session::LinuxSession;
 
 const XK_CONTROL_L: u32 = 0xffe3;
@@ -34,7 +35,8 @@ pub struct LinuxPaster {
 
 enum Backend {
     X11(Box<X11Paster>),
-    Wayland(WaylandModifierState),
+    WaylandWtype(WaylandModifierState),
+    WaylandPortal(WaylandModifierState, Option<PortalKeyboard>),
 }
 
 impl LinuxPaster {
@@ -49,7 +51,11 @@ impl LinuxPaster {
                 let modifiers = wayland_modifiers.ok_or_else(|| {
                     eyre!("Wayland paste requires the active hotkey modifier state")
                 })?;
-                Backend::Wayland(modifiers)
+                if linux_portal_paste::uses_portal() {
+                    Backend::WaylandPortal(modifiers, None)
+                } else {
+                    Backend::WaylandWtype(modifiers)
+                }
             }
         };
         Ok(Self {
@@ -65,7 +71,7 @@ impl LinuxPaster {
         }
         match &mut self.backend {
             Backend::X11(paster) => paster.paste(text, &self.stop, self.paste_with_shift)?,
-            Backend::Wayland(modifiers) => {
+            Backend::WaylandWtype(modifiers) => {
                 wait_for_modifiers(&self.stop, || Ok(modifiers.held()))?;
                 let mut copy = Command::new("wl-copy");
                 copy.args(["--type", "text/plain;charset=utf-8"]);
@@ -78,6 +84,26 @@ impl LinuxPaster {
                 keys.args(paste_keys(self.paste_with_shift));
                 run_helper(keys, &[], &self.stop, HELPER_TIMEOUT)
                     .wrap_err("could not send the Wayland paste shortcut; install wtype and use a compositor supporting virtual keyboards")?;
+            }
+            Backend::WaylandPortal(modifiers, keyboard) => {
+                wait_for_modifiers(&self.stop, || Ok(modifiers.held()))?;
+                if keyboard.is_none() {
+                    *keyboard = Some(PortalKeyboard::connect(&self.stop)?);
+                }
+                let mut copy = Command::new("wl-copy");
+                copy.args(["--type", "text/plain;charset=utf-8"]);
+                run_helper(copy, text.as_bytes(), &self.stop, HELPER_TIMEOUT)
+                    .wrap_err("could not own the Wayland clipboard; install wl-clipboard and check compositor support")?;
+                wait_for_modifiers(&self.stop, || Ok(modifiers.held()))?;
+                if let Err(error) = keyboard
+                    .as_mut()
+                    .expect("portal keyboard initialized")
+                    .paste_shortcut(&self.stop, self.paste_with_shift)
+                {
+                    // A revoked or disconnected session must not poison later jobs.
+                    *keyboard = None;
+                    return Err(error);
+                }
             }
         }
         // Give the target time to request the selection before the next queued

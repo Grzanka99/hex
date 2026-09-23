@@ -5782,6 +5782,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5da3b0203fd7ee5720aa0b5e790b591aa5d3f41c3ed2c34a3a393382198af2f7"
 
 [[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5808,7 +5814,7 @@ dependencies = [
  "log",
  "parking_lot",
  "pin-project",
- "pollster",
+ "pollster 0.2.5",
  "static_assertions",
  "thiserror 1.0.69",
 ]
@@ -6521,6 +6527,17 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reis"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b967ec6489a42067a20724f11987bb96178ea796873cbe1afd25fb93ee6f85f"
+dependencies = [
+ "enumflags2",
+ "log",
+ "rustix 1.1.4",
+]
 
 [[package]]
 name = "resvg"
@@ -8656,6 +8673,8 @@ name = "voice-control"
 version = "2.1.22"
 dependencies = [
  "arboard",
+ "ashpd 0.12.3",
+ "async-io",
  "base64",
  "block2",
  "cc",
@@ -8670,6 +8689,7 @@ dependencies = [
  "ed25519-dalek",
  "evdev",
  "fs2",
+ "futures-lite 2.6.1",
  "getrandom 0.4.3",
  "gpui",
  "gpui-symbols",
@@ -8686,8 +8706,10 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "objc2-service-management",
+ "pollster 0.4.0",
  "ratatui",
  "regex",
+ "reis",
  "rodio",
  "rubato",
  "screencapturekit 8.0.1",
@@ -8704,6 +8726,7 @@ dependencies = [
  "url",
  "x11-clipboard",
  "x11rb",
+ "xkbcommon",
 ]
 
 [[package]]

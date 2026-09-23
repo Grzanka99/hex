@@ -187,11 +187,13 @@ Diagnostics are stored at:
 
 ## Linux Beta
 
-The Linux beta targets x86_64 Linux on i3/X11 and compatible wlroots Wayland
-compositors. It supports local hotkey dictation, a GPUI settings shell, and
-signed updates for direct installs. Native Wayland requires explicit input-device
-access and compositor support for clipboard, virtual-keyboard, and layer-shell
-protocols. Voice commands and meetings are not included.
+The Linux beta targets x86_64 Linux on i3/X11 and compatible Wayland
+compositors such as Hyprland and Sway. It supports local hotkey dictation, a
+GPUI settings shell, and signed updates for direct installs. Native Wayland
+requires explicit input-device access. KDE Plasma and GNOME use a portal-backed
+paste shortcut path; KDE paste was confirmed on a physical desktop, while GNOME
+remains unverified and has no layer-shell HUD.
+Voice commands and meetings are not included.
 
 Use the [Linux installation guide](docs/linux.md) to build from source until
 the first signed Linux release is published. It also describes the planned

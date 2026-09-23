@@ -1,7 +1,8 @@
 # Linux Plan
 
 **Status:** Active validation and capability plan. The x86_64 X11 beta,
-wlroots-compatible native Wayland path, and Nix packaging are implemented.
+virtual-keyboard-compatible native Wayland path, KDE/GNOME portal keyboard
+insertion, and Nix packaging are implemented.
 Physical desktop/input validation and a genuine signed update remain release
 gates; automated checks alone do not establish those behaviors.
 
@@ -13,7 +14,7 @@ The Linux beta keeps its contracts explicit:
 | --- | --- |
 | Distribution | Signed user-local direct install, or Nix-owned package updates |
 | Host | x86_64 Linux; Arch/i3 reference and NixOS packaging |
-| Desktop | i3/X11 or compatible wlroots Wayland compositor |
+| Desktop | i3/X11 or compatible Wayland compositor; KDE paste confirmed, GNOME awaits native validation |
 | Audio | CPAL through ALSA, typically backed by PipeWire |
 | Inference | Vulkan with CPU fallback |
 | Shortcut | Configurable key-containing chord; default `Alt+Space` |
@@ -22,7 +23,8 @@ The Linux beta keeps its contracts explicit:
 
 The beta does not claim voice commands, application or browser context,
 meetings, or universal Wayland support. Wayland needs explicit read access to
-all event devices, `wl-copy`, `wtype`, and compatible compositor protocols.
+all event devices and `wl-copy`; virtual-keyboard compositors also need `wtype`.
+KDE/GNOME use portal-authorized libei for paste, and GNOME has no layer-shell HUD.
 There is no hidden XWayland or privileged injection fallback. See
 [`../linux.md`](../linux.md) and [`../nix.md`](../nix.md).
 
@@ -37,7 +39,8 @@ There is no hidden XWayland or privileged injection fallback. See
 - Per-user systemd service, independent GPUI Settings client, CLI controls,
   owner-only Unix IPC, desktop launcher, and service-only autostart entry.
 - Native Wayland evdev input with explicit key mapping, cancellation, and
-  device rediscovery; persistent click-through recording/processing overlay.
+  device rediscovery; click-through recording/processing overlay where layer-shell
+  is available. KDE/GNOME use the keyboard-only RemoteDesktop portal for paste.
 - Visible listener controls, transactional shortcut edits, and explicit service
   shutdown; closing Settings leaves the managed runtime running.
 - Nix package and matching development shell, NixOS installation, optional

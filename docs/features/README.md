@@ -455,7 +455,9 @@ Linux beta                               // not macOS feature parity
 ├── hex app -> Settings client; closing it leaves the runtime running
 ├── Recording sounds -> Shortcut press / capture stop / active cancellation
 ├── X11 -> No tray or recording HUD; service status and sounds remain available
-├── Wayland -> evdev + compositor protocols; keys observed, not suppressed
+├── Wayland -> evdev input; keys observed, not suppressed
+│   ├── Virtual-keyboard compositors -> wl-copy + wtype paste
+│   └── KDE / GNOME -> wl-copy + keyboard-only RemoteDesktop portal/libei paste
 │   └── Mouse-classified nodes excluded; live modifiers reused for paste
 ├── Escape -> Cancel active capture, not newest accepted job
 ├── Microphone failure -> Listener exits, not macOS automatic recovery
@@ -465,7 +467,13 @@ Linux beta                               // not macOS feature parity
 No Linux Commands, Voice Action, Modes processing, retained History, or meetings.
 `hex listen` instead prints Moonshine transcripts. Wayland needs explicit broad
 input-device access; physical reconnect and click-through still need native
-evidence. Its [smoke](../../scripts/test-wayland-paste.sh) explicitly isolates
+evidence. KDE and GNOME insertion request portal keyboard control on first
+paste, retain a private restore token when granted, and fail explicitly when
+authorization is denied or the keyboard device disappears. KDE Plasma Wayland
+paste was confirmed by the user on an installed source build; GNOME, portal
+revocation recovery, and other target applications remain unverified. GNOME
+lacks the layer-shell HUD, and its hotkey interactions remain unvalidated.
+The [Sway smoke](../../scripts/test-wayland-paste.sh) isolates
 `HEX_APPLICATION_SUPPORT_DIR` and checks that Settings can exit without stopping
 the service.
 
@@ -478,7 +486,7 @@ modifier state to paste, avoiding two full device scans after every dictation.
 and `live_modifier_snapshot_tracks_edges_and_device_loss` cover those policies;
 the nested-compositor smoke remains the native insertion check.
 
-See the [Linux guide](../linux.md), [linux_app.rs](../../src/linux_app.rs),
+See the [Linux guide](../linux.md), [linux_portal_paste.rs](../../src/linux_portal_paste.rs), [linux_paste.rs](../../src/linux_paste.rs), [linux_app.rs](../../src/linux_app.rs),
 [linux_wayland_input.rs](../../src/linux_wayland_input.rs), and
 [Linux CI](../../.github/workflows/check-linux.yml) for existing checks.
 The [direct installer/updater](../../src/linux_updater.rs) and
@@ -493,6 +501,7 @@ Linux runtime                            // maintain.linux-service
 ├── Close/crash Settings -> Keep microphone, accepted jobs, and model preparation
 │   └── Uncommitted shortcut capture -> Cancel and restore the prior listening state
 ├── Service restart -> Client reconnects; uncertain commands are not replayed
+├── Desktop changes -> Backend/display/runtime/desktop mismatch restarts the service
 └── hex stop / systemctl --user stop hex -> Stop workers and release devices
 ```
 

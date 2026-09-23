@@ -57,6 +57,8 @@ pub struct Session {
     backend: String,
     display: String,
     runtime: String,
+    #[serde(default)]
+    desktop: String,
 }
 
 impl Session {
@@ -71,6 +73,7 @@ impl Session {
             })
             .unwrap_or_default(),
             runtime: std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+            desktop: std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
         }
     }
 }

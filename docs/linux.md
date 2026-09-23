@@ -1,7 +1,9 @@
 # Install The Linux Beta
 
-The Linux beta targets x86_64 Linux: i3/X11 and compatible wlroots-based Wayland
-compositors such as Hyprland or Sway. Audio uses ALSA, including PipeWire systems
+The Linux beta targets x86_64 Linux: i3/X11 and compatible Wayland
+compositors such as Hyprland or Sway. KDE Plasma and GNOME have a portal-backed
+paste path; KDE paste was confirmed on a physical desktop, while GNOME remains
+unverified. Audio uses ALSA, including PipeWire systems
 with ALSA compatibility. Inference uses Vulkan when available and can fall back
 to the CPU. The GPUI Settings window still needs a Vulkan driver, even with CPU
 inference; `vulkan-icd-loader` alone is not a driver. Install a driver for your GPU
@@ -9,8 +11,9 @@ or a software Vulkan driver. See the Wayland requirements below before enabling
 native input.
 
 The beta does not support voice commands, application or browser context, or
-meetings. This is not universal Wayland support: GNOME and KDE are not covered
-by the current clipboard, virtual-keyboard, and overlay protocol contract.
+meetings. This is not universal Wayland support: GNOME does not provide the
+layer-shell recording HUD, and GNOME hotkeys and portal paste still need
+physical validation.
 
 For Nix/NixOS, use the [Nix guide](nix.md). Nix owns updates to that installation;
 HEX's signed updater owns only the direct-install layout below.
@@ -45,7 +48,7 @@ granted. The service is `PartOf=graphical-session.target`; desktops managing a
 custom session target must bind its lifetime to their login/logout lifecycle.
 Restart-on-failure belongs to systemd, not the Settings process.
 There is one active desktop service per user: `hex start` hands it over with a
-restart if the display/session changed. Opening Settings alone never silently
+restart if the display/session/desktop changed. Opening Settings alone never silently
 moves an existing runtime from another desktop.
 
 IPC uses an owner-only Unix socket in HEX's data directory, same-user peer
@@ -157,12 +160,16 @@ application (see [#24](https://github.com/anomalyco/hex/issues/24)).
 - Export the compositor's nonempty `WAYLAND_DISPLAY` in the launch environment.
   HEX, GTK, and GPUI select the same native backend even when XWayland's
   `DISPLAY` is also present. `XDG_SESSION_TYPE` alone does not select Wayland.
-- Install `wl-clipboard` and `wtype`. The compositor must support their clipboard
-  and virtual-keyboard protocols. There is no silent XWayland, direct-typing, or
-  privileged input-injection fallback. Transcript text travels on stdin, not
-  command-line arguments.
-- The overlay requires layer-shell. Settings reports when the HUD is unavailable
-  rather than presenting a normal focus-taking window as an overlay.
+- Install `wl-clipboard`. Hyprland, Sway, and compatible compositors use
+  `wtype` for the paste chord and need its virtual-keyboard protocol. KDE and
+  GNOME instead request keyboard-only control through the RemoteDesktop portal
+  and send the chord via libei. The user must approve the portal request; HEX
+  keeps a private restore token if the desktop grants persistence. Denial or
+  revocation fails paste explicitly. There is no silent XWayland or privileged
+  input-injection fallback. Transcript text travels on stdin, not argv.
+- The overlay requires layer-shell. KDE implements it; GNOME does not. Settings
+  reports when the HUD is unavailable rather than presenting a normal
+  focus-taking window as an overlay.
 - The evdev backend requires read access to **every `/dev/input/event*` node**
   so it can inspect which devices may hold modifier keys. An unreadable node
   causes an explicit startup error, not a listener that reports ready but cannot
