@@ -21,10 +21,7 @@ use crate::app_settings::{
 use crate::application_catalog::InstalledApplication;
 use crate::commands::{CommandConfig, CommandInfo, CommandScope};
 use crate::desktop_activity::DesktopActivity;
-use crate::desktop_host::{
-    DesktopAction, DesktopCapabilities, DesktopHost, DesktopSnapshot, DesktopTranscriptionSnapshot,
-    DesktopUpdateStatus,
-};
+use crate::desktop_host::DesktopCapabilities;
 use crate::desktop_transcription_picker::{
     TranscriptionPickerDelegate, TranscriptionPickerModel, TranscriptionPickerProgress,
     TranscriptionPickerStatus, TranscriptionPickerView,
@@ -628,9 +625,24 @@ struct ModeInputs {
     replacements: Vec<ReplacementInputs>,
 }
 
-struct ProcessingInputs {
-    default_mode: ModeInputs,
-    modes: Vec<ModeInputs>,
+struct ModeEditor {
+    // Authoritative editor draft; AppSettings receives a projection only when
+    // constructing a save candidate, never by keeping parallel indices in sync.
+    settings: DictationMode,
+    inputs: ModeInputs,
+}
+
+struct ModeEditors {
+    default_mode: ModeEditor,
+    modes: Vec<ModeEditor>,
+}
+
+impl ModeEditors {
+    fn project(&self, settings: &mut AppSettings) {
+        settings.dictation_processing.default_mode = self.default_mode.settings.clone();
+        settings.dictation_processing.modes =
+            self.modes.iter().map(|row| row.settings.clone()).collect();
+    }
 }
 
 struct VoiceActionInputs {
@@ -827,6 +839,19 @@ enum HotkeyKind {
     PasteLast,
 }
 
+fn set_hotkey_binding(settings: &mut AppSettings, kind: HotkeyKind, binding: HotkeyBinding) {
+    match kind {
+        HotkeyKind::Dictation => {
+            if binding.key.is_none() {
+                settings.double_tap_only = false;
+            }
+            settings.dictation_hotkey = binding;
+        }
+        HotkeyKind::Edit => settings.edit_hotkey = binding,
+        HotkeyKind::PasteLast => settings.paste_last_hotkey = Some(binding),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MicrophonePolicyChange {
     SetCommands(bool),
@@ -939,6 +964,8 @@ pub struct AppWindow {
     permission_refresh_at: Instant,
     settings: AppSettings,
     settings_load_error: Option<String>,
+    #[cfg(test)]
+    settings_save_override: Option<fn(&AppSettings) -> color_eyre::Result<()>>,
     microphone_devices: Vec<String>,
     microphone_picker_open: bool,
     microphone_picker_error: Option<String>,
@@ -959,13 +986,10 @@ pub struct AppWindow {
     variant_picker_open: Option<ModelPickerTarget>,
     transcription_hints: ProcessingInput,
     transcription_picker_language: Option<String>,
-    transcription_picker_error: Option<String>,
-    transcription_downloading: Option<TranscriptionModelId>,
+    transcription_status: PreparationStatus,
     transcription_preparation: TranscriptionPreparation,
-    transcription_downloaded_bytes: u64,
-    transcription_activation_started: Option<Instant>,
     transcription_preview_installed: Option<bool>,
-    processing_inputs: ProcessingInputs,
+    mode_editors: ModeEditors,
     voice_action_inputs: VoiceActionInputs,
     selected_mode: ModeSelection,
     model_catalog: ModelCatalogState,
@@ -1157,7 +1181,7 @@ impl AppWindow {
         };
         let transcription_hints =
             Self::transcription_hints_input(&settings.transcription.recognition_hints, cx);
-        let processing_inputs = Self::processing_inputs(&settings, cx);
+        let mode_editors = Self::mode_editors(&settings, cx);
         let voice_action_inputs = Self::voice_action_inputs(&settings, cx);
         let (model_catalog, model_catalog_receiver) = if preview
             .as_ref()
@@ -1294,10 +1318,14 @@ impl AppWindow {
         let onboarding_completed = preview_mode || crate::onboarding::completion_recorded();
         let setup_visible = preview.as_ref().is_some_and(|preview| preview.onboarding)
             || !onboarding_completed && !setup_status.ready();
-        let microphone_devices = crate::audio::input_device_names().unwrap_or_else(|error| {
-            tracing::warn!(%error, "could not list microphones for settings");
-            Vec::new()
-        });
+        let microphone_devices = if preview_mode {
+            vec!["Built-in Microphone".into()]
+        } else {
+            crate::audio::input_device_names().unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not list microphones for settings");
+                Vec::new()
+            })
+        };
         let (launch_at_login_status, launch_at_login_error) = if preview_mode {
             (LoginItemStatus::Disabled, None)
         } else {
@@ -1382,21 +1410,20 @@ impl AppWindow {
             variant_picker_open: None,
             transcription_hints,
             transcription_picker_language: preview_picker.map(|(language, _)| language.clone()),
-            transcription_picker_error: matches!(
-                preview_model_state,
-                Some(PreviewModelState::Error)
-            )
-            .then(|| "Preview download failed while verifying the model checksum.".into()),
-            transcription_downloading: preview_downloading,
+            transcription_status: PreparationStatus {
+                model: preview_downloading,
+                downloaded_bytes: preview_downloading
+                    .and_then(|model| definition(model).download_bytes())
+                    .map_or(0, |bytes| bytes * 37 / 100),
+                error: matches!(preview_model_state, Some(PreviewModelState::Error))
+                    .then(|| "Preview download failed while verifying the model checksum.".into()),
+                ..Default::default()
+            },
             transcription_preparation: if preview.is_some() {
                 TranscriptionPreparation::default()
             } else {
                 cx.default_global::<TranscriptionPreparation>().clone()
             },
-            transcription_downloaded_bytes: preview_downloading
-                .and_then(|model| definition(model).download_bytes())
-                .map_or(0, |bytes| bytes * 37 / 100),
-            transcription_activation_started: None,
             transcription_preview_installed: match preview_model_state {
                 Some(PreviewModelState::Installed) => Some(true),
                 Some(
@@ -1406,7 +1433,7 @@ impl AppWindow {
                 ) => Some(false),
                 Some(PreviewModelState::Actual) | None => preview_model_missing.then_some(false),
             },
-            processing_inputs,
+            mode_editors,
             voice_action_inputs,
             selected_mode: if preview
                 .as_ref()
@@ -1476,6 +1503,8 @@ impl AppWindow {
             _activation_subscription: activation_subscription,
             settings,
             settings_load_error,
+            #[cfg(test)]
+            settings_save_override: None,
             meetings: Vec::new(),
             meetings_error: None,
             meeting_runtime_error: None,
@@ -1603,7 +1632,7 @@ impl AppWindow {
         change: MicrophonePolicyChange,
         cx: &mut Context<Self>,
     ) -> color_eyre::Result<()> {
-        let mut candidate = self.settings.clone();
+        let mut candidate = self.settings_candidate();
         match change {
             MicrophonePolicyChange::SetCommands(enabled) => {
                 candidate.set_commands_enabled(enabled)?
@@ -1618,7 +1647,9 @@ impl AppWindow {
                 candidate.disable_commands_and_release_microphone()
             }
         }
-        self.commit_settings(candidate)?;
+        let result = self.commit_settings(candidate);
+        cx.notify();
+        result?;
         self.commands_toggle
             .set_enabled(self.settings.commands_enabled);
         self.release_microphone_toggle
@@ -1702,14 +1733,9 @@ impl AppWindow {
             return false;
         }
         let status = self.transcription_preparation.status();
-        let changed = self.transcription_downloading != status.model
-            || self.transcription_downloaded_bytes != status.downloaded_bytes
-            || self.transcription_picker_error != status.error;
-        self.transcription_downloading = status.model;
-        self.transcription_downloaded_bytes = status.downloaded_bytes;
-        self.transcription_activation_started = status.started;
-        self.transcription_picker_error = status.error;
-        changed || status.model.is_some()
+        let changed = self.transcription_status != status;
+        self.transcription_status = status;
+        changed || self.transcription_status.model.is_some()
     }
 
     fn poll_setup(&mut self, force: bool) -> bool {
@@ -1830,14 +1856,14 @@ impl AppWindow {
         selection: TranscriptionSelection,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        validate(&selection).map_err(|error| error.to_string())?;
+        let mut candidate = self.settings_candidate();
+        candidate.remember_transcription(selection);
+        self.commit_settings(candidate)
+            .map_err(|error| error.to_string())?;
         if self.preview {
-            self.settings.remember_transcription(selection);
             self.transcription_preview_installed = Some(true);
             self.setup_status.transcription_model = true;
-        } else {
-            self.settings
-                .save_transcription(selection)
-                .map_err(|error| error.to_string())?;
         }
         self.transcription_hints.entity.update(cx, |input, cx| {
             input.set_text(&self.settings.transcription.recognition_hints, cx);
@@ -1886,14 +1912,12 @@ impl AppWindow {
 
     fn cancel_transcription_download(&mut self) {
         self.transcription_preparation.cancel();
-        self.transcription_downloading = None;
-        self.transcription_downloaded_bytes = 0;
-        self.transcription_activation_started = None;
+        self.transcription_status = self.transcription_preparation.status();
     }
 
     fn clear_transcription_error(&mut self) {
         self.transcription_preparation.set_error(None);
-        self.transcription_picker_error = None;
+        self.transcription_status = self.transcription_preparation.status();
     }
 
     fn transcription_model_installed(&self, model: &ModelDefinition, language: &str) -> bool {
@@ -2113,13 +2137,14 @@ impl AppWindow {
         if self.settings.history_retention == retention {
             return;
         }
-        self.settings.history_retention = retention;
+        if !self.update_settings(cx, |settings| settings.history_retention = retention) {
+            return;
+        }
         if let Some(history) = &self.history
             && let Err(error) = history.set_retention(retention)
         {
             self.history_error = Some(error.to_string());
         }
-        self.save_settings(cx);
         self.reload_history(cx);
         cx.notify();
     }
@@ -2484,18 +2509,20 @@ impl AppWindow {
     }
 
     fn render_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let items = Pane::all(self.capabilities())
-            .into_iter()
-            .enumerate()
-            .map(|(index, pane)| {
-                let selected = self.pane == pane;
-                navigation_item(pane.icon(), selected)
-                    .id(("app-nav", index))
-                    .child(pane.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_pane(pane, cx);
-                    }))
-            });
+        let items = Pane::all(DesktopCapabilities::macos(
+            crate::DEVELOPER_FEATURES_ENABLED,
+        ))
+        .into_iter()
+        .enumerate()
+        .map(|(index, pane)| {
+            let selected = self.pane == pane;
+            navigation_item(pane.icon(), selected)
+                .id(("app-nav", index))
+                .child(pane.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_pane(pane, cx);
+                }))
+        });
 
         sidebar_frame()
             .w(px(SIDEBAR_WIDTH))
@@ -2771,16 +2798,16 @@ impl AppWindow {
                                     else {
                                         return;
                                     };
-                                    let Some(binding) = this.hotkey_binding_mut(kind) else {
+                                    if !this.update_settings(cx, |settings| {
+                                        set_hotkey_binding(settings, kind, candidate);
+                                    }) {
                                         return;
-                                    };
-                                    *binding = candidate;
+                                    }
                                     if kind == HotkeyKind::Edit {
                                         this.voice_action_inputs.error = None;
                                     }
                                     this.hotkey_side_selection_springs[hotkey_kind_index(kind)]
                                         .set_target(index as f32);
-                                    this.save_settings(cx);
                                 }))
                         }),
                     ),
@@ -2793,21 +2820,15 @@ impl AppWindow {
             .into_any_element()
     }
 
-    fn hotkey_binding_mut(&mut self, kind: HotkeyKind) -> Option<&mut HotkeyBinding> {
-        match kind {
-            HotkeyKind::Dictation => Some(&mut self.settings.dictation_hotkey),
-            HotkeyKind::Edit => Some(&mut self.settings.edit_hotkey),
-            HotkeyKind::PasteLast => self.settings.paste_last_hotkey.as_mut(),
-        }
-    }
-
     fn begin_hotkey_capture(
         &mut self,
         kind: HotkeyKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        crate::app_settings::set_hotkey_capture_active(true);
+        if !self.preview {
+            crate::app_settings::set_hotkey_capture_active(true);
+        }
         self.hotkey_width_spring.set_target(hotkey_capture_width(0));
         self.hotkey_capture = HotkeyCaptureState::Listening {
             kind,
@@ -2822,7 +2843,9 @@ impl AppWindow {
 
     fn cancel_hotkey_capture(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.hotkey_capture, HotkeyCaptureState::Idle) {
-            crate::app_settings::set_hotkey_capture_active(false);
+            if !self.preview {
+                crate::app_settings::set_hotkey_capture_active(false);
+            }
             self.hotkey_capture = HotkeyCaptureState::Idle;
             self.hotkey_capture_animation.set_enabled(false);
             self.hotkey_width_spring.set_target(HOTKEY_MIN_WIDTH);
@@ -2934,22 +2957,19 @@ impl AppWindow {
             self.set_hotkey_capture_message("Already in use", cx);
             return;
         }
-        let key_based = binding.key.is_some();
+        let keycap_count = binding.keycaps().len();
+        if !self.update_settings(cx, |settings| set_hotkey_binding(settings, kind, binding)) {
+            self.set_hotkey_capture_message("Could not save shortcut. Try again.", cx);
+            return;
+        }
         self.hotkey_width_spring
-            .set_target(hotkey_saved_width(binding.keycaps().len()));
-        match kind {
-            HotkeyKind::Dictation => self.settings.dictation_hotkey = binding,
-            HotkeyKind::Edit => {
-                self.settings.edit_hotkey = binding;
-                self.voice_action_inputs.error = None;
-            }
-            HotkeyKind::PasteLast => self.settings.paste_last_hotkey = Some(binding),
+            .set_target(hotkey_saved_width(keycap_count));
+        if kind == HotkeyKind::Edit {
+            self.voice_action_inputs.error = None;
         }
-        if kind == HotkeyKind::Dictation && !key_based {
-            self.settings.double_tap_only = false;
+        if !self.preview {
+            crate::app_settings::set_hotkey_capture_active(false);
         }
-        self.save_settings(cx);
-        crate::app_settings::set_hotkey_capture_active(false);
         self.hotkey_capture = HotkeyCaptureState::Saved {
             kind,
             saved_at: Instant::now(),
@@ -3004,9 +3024,11 @@ impl AppWindow {
                             .text_size(px(14.0))
                             .text_color(rgb(MUTED))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mode_inputs_mut(selection).replacements.remove(index);
-                                this.mode_settings_mut(selection).replacements.remove(index);
-                                this.save_settings(cx);
+                                if this.update_mode_settings(selection, cx, |mode| {
+                                    mode.replacements.remove(index);
+                                }) {
+                                    this.mode_inputs_mut(selection).replacements.remove(index);
+                                }
                             })),
                     )
                     .into_any_element()
@@ -3017,14 +3039,14 @@ impl AppWindow {
             .id("add-mode-replacement")
             .on_click(cx.listener(move |this, _, window, cx| {
                 let replacement = TextReplacement::default();
-                let inputs = Self::replacement_inputs(&replacement, cx);
-                let focus = inputs.matched_phrase.entity.focus_handle(cx);
-                this.mode_inputs_mut(selection).replacements.push(inputs);
-                this.mode_settings_mut(selection)
-                    .replacements
-                    .push(replacement);
-                this.save_settings(cx);
-                focus.focus(window);
+                if this.update_mode_settings(selection, cx, |mode| {
+                    mode.replacements.push(replacement.clone());
+                }) {
+                    let inputs = Self::replacement_inputs(&replacement, cx);
+                    let focus = inputs.matched_phrase.entity.focus_handle(cx);
+                    this.mode_inputs_mut(selection).replacements.push(inputs);
+                    focus.focus(window);
+                }
             }))
             .into_any_element();
 
@@ -3050,7 +3072,7 @@ impl AppWindow {
             .map(|choice| {
                 let model = choice.model;
                 let installed = self.transcription_model_installed(model, selected_language);
-                let downloading = self.transcription_downloading == Some(model.id);
+                let downloading = self.transcription_status.model == Some(model.id);
                 let active = transcription_selection_is_active(
                     &self.settings.transcription,
                     model,
@@ -3059,7 +3081,8 @@ impl AppWindow {
                 );
                 let progress = if downloading {
                     model.download_bytes().map_or(0.0, |bytes| {
-                        (self.transcription_downloaded_bytes as f32 / bytes as f32).clamp(0.0, 1.0)
+                        (self.transcription_status.downloaded_bytes as f32 / bytes as f32)
+                            .clamp(0.0, 1.0)
                     })
                 } else {
                     0.0
@@ -3067,10 +3090,12 @@ impl AppWindow {
                 let status = if downloading {
                     if installed {
                         let elapsed = self
-                            .transcription_activation_started
+                            .transcription_status
+                            .started
                             .map_or(0, |started| started.elapsed().as_secs());
                         let progress = self
-                            .transcription_activation_started
+                            .transcription_status
+                            .started
                             .map_or(0.0, |started| (started.elapsed().as_secs_f32() % 1.6) / 1.6);
                         TranscriptionPickerStatus::Preparing {
                             label: format!("Loading model · {elapsed}s"),
@@ -3092,7 +3117,7 @@ impl AppWindow {
             })
             .collect();
         TranscriptionPickerView {
-            error: self.transcription_picker_error.clone(),
+            error: self.transcription_status.error.clone(),
             language: selected_language.to_string(),
             models,
         }
@@ -3121,10 +3146,10 @@ impl AppWindow {
             self.settings.microphone.clone(),
             self.microphone_picker_error.clone(),
             cx.listener(|this, device: &Option<String>, _, cx| {
-                this.settings.microphone = device.clone();
-                this.microphone_picker_open = false;
-                this.microphone_picker_error = None;
-                this.save_settings(cx);
+                if this.update_settings(cx, |settings| settings.microphone = device.clone()) {
+                    this.microphone_picker_open = false;
+                    this.microphone_picker_error = None;
+                }
             }),
             cx.listener(|this, _, _, cx| {
                 this.microphone_picker_open = false;
@@ -3194,7 +3219,7 @@ impl AppWindow {
             return None;
         }
         let dictation_notice =
-            dictation_model_notice(self.setup_status, self.transcription_downloading.is_some());
+            dictation_model_notice(self.setup_status, self.transcription_status.model.is_some());
         let (title, description) = dictation_notice.or_else(|| {
             self.settings
                 .commands_enabled
@@ -3350,13 +3375,16 @@ impl AppWindow {
                     .text_size(px(9.0))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings.sound_effects = volume > 0.0;
-                        if volume > 0.0 {
-                            this.settings.sound_effect_volume = volume;
+                        if !this.update_settings(cx, |settings| {
+                            settings.sound_effects = volume > 0.0;
+                            if volume > 0.0 {
+                                settings.sound_effect_volume = volume;
+                            }
+                        }) {
+                            return;
                         }
                         this.sound_volume_spring.set_target(index as f32);
-                        this.save_settings(cx);
-                        if volume > 0.0 {
+                        if volume > 0.0 && !this.preview {
                             crate::feedback::play(crate::feedback::Tone::DictationStart);
                         }
                     }))
@@ -3391,9 +3419,11 @@ impl AppWindow {
                             if this.settings.recording_audio_behavior == behavior {
                                 return;
                             }
-                            this.settings.recording_audio_behavior = behavior;
-                            this.recording_audio_spring.set_target(index as f32);
-                            this.save_settings(cx);
+                            if this.update_settings(cx, |settings| {
+                                settings.recording_audio_behavior = behavior
+                            }) {
+                                this.recording_audio_spring.set_target(index as f32);
+                            }
                         }))
                 }),
             );
@@ -3568,12 +3598,7 @@ impl AppWindow {
                                         .id("double-tap-setting")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             let enabled = !this.settings.double_tap_lock;
-                                            if let Err(error) = this.dispatch(
-                                                DesktopAction::SetDoubleTapLock(enabled),
-                                            ) {
-                                                tracing::error!(%error, "could not update double-tap setting");
-                                            }
-                                            cx.notify();
+                                            this.set_double_tap_lock(enabled, cx);
                                         })),
                                     )
                                     .child(
@@ -3590,12 +3615,7 @@ impl AppWindow {
                                                 .id("double-tap-only-setting")
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     let enabled = !this.settings.double_tap_only;
-                                                    if let Err(error) = this.dispatch(
-                                                        DesktopAction::SetDoubleTapOnly(enabled),
-                                                    ) {
-                                                        tracing::error!(%error, "could not update double-tap-only setting");
-                                                    }
-                                                    cx.notify();
+                                                    this.set_double_tap_only(enabled, cx);
                                                 })),
                                             ),
                                     )
@@ -3612,8 +3632,7 @@ impl AppWindow {
                                                     compact_button("Disable")
                                                         .id("disable-paste-last-hotkey")
                                                         .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.settings.paste_last_hotkey = None;
-                                                            this.save_settings(cx);
+                                                            this.update_settings(cx, |settings| settings.paste_last_hotkey = None);
                                                         })),
                                                 ),
                                         )
@@ -3666,17 +3685,19 @@ impl AppWindow {
                                         )
                                         .id("dock-icon-setting")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.settings.show_dock_icon =
-                                                !this.settings.show_dock_icon;
+                                            if !this.update_settings(cx, |settings| settings.show_dock_icon = !settings.show_dock_icon) {
+                                                return;
+                                            }
                                             this.dock_icon_toggle
                                                 .set_enabled(this.settings.show_dock_icon);
-                                            crate::app_settings::set_dock_icon_visible(
-                                                this.settings.show_dock_icon,
-                                            );
+                                            if !this.preview {
+                                                crate::app_settings::set_dock_icon_visible(
+                                                    this.settings.show_dock_icon,
+                                                );
+                                            }
                                             if this.settings.show_dock_icon {
                                                 cx.activate(true);
                                             }
-                                            this.save_settings(cx);
                                         })),
                                     )
                                     .child(
@@ -3774,7 +3795,8 @@ impl AppWindow {
             ));
         }
         let models_ready = status.transcription_model;
-        let model_notice = dictation_model_notice(status, self.transcription_downloading.is_some());
+        let model_notice =
+            dictation_model_notice(status, self.transcription_status.model.is_some());
         let models = if models_ready {
             setup_ready_badge()
         } else {
@@ -3898,16 +3920,16 @@ impl AppWindow {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.cancel_hotkey_capture(cx);
                 let enabled = !this.settings.voice_action.enabled;
-                let result = set_voice_action_enabled(&mut this.settings, enabled)
+                let mut candidate = this.settings_candidate();
+                let result = set_voice_action_enabled(&mut candidate, enabled)
                     .map_err(|message| color_eyre::eyre::eyre!(message))
-                    .and_then(|()| this.persist_settings());
+                    .and_then(|()| this.commit_settings(candidate));
                 match result {
                     Ok(()) => {
                         this.voice_action_inputs.enabled_toggle.set_enabled(enabled);
                         this.voice_action_inputs.error = None;
                     }
                     Err(error) => {
-                        this.settings.voice_action.enabled = !enabled;
                         this.voice_action_inputs.error = Some(error.to_string());
                     }
                 }
@@ -4025,6 +4047,9 @@ impl AppWindow {
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
+        // Modes and text fields are explicit drafts; failed writes remain dirty
+        // for retry or the close-time flush.
+        self.settings_dirty = true;
         if let Err(error) = self.persist_settings() {
             tracing::error!(%error, "could not save app settings");
         }
@@ -4032,20 +4057,74 @@ impl AppWindow {
     }
 
     fn persist_settings(&mut self) -> color_eyre::Result<()> {
-        self.commit_settings(self.settings.clone())
+        self.commit_settings(self.settings_candidate())
+    }
+
+    fn settings_candidate(&self) -> AppSettings {
+        let mut candidate = self.settings.clone();
+        self.mode_editors.project(&mut candidate);
+        candidate
     }
 
     /// Saves before assigning so a failed save leaves the live settings
     /// untouched; the generation bump supersedes any pending debounced save.
     fn commit_settings(&mut self, candidate: AppSettings) -> color_eyre::Result<()> {
-        if !self.preview {
-            candidate.save()?;
+        #[cfg(test)]
+        if let Some(save) = self.settings_save_override {
+            return self.commit_settings_with(candidate, save);
         }
-        self.settings = candidate;
+        let preview = self.preview;
+        self.commit_settings_with(
+            candidate,
+            |candidate| {
+                if preview { Ok(()) } else { candidate.save() }
+            },
+        )
+    }
+
+    fn commit_settings_with(
+        &mut self,
+        candidate: AppSettings,
+        save: impl FnOnce(&AppSettings) -> color_eyre::Result<()>,
+    ) -> color_eyre::Result<()> {
+        if let Err(error) = self.settings.commit_with(candidate, save) {
+            self.settings_load_error = Some(error.to_string());
+            return Err(error);
+        }
         self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
         self.settings_dirty = false;
         self.settings_load_error = None;
         Ok(())
+    }
+
+    fn update_settings(
+        &mut self,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut AppSettings),
+    ) -> bool {
+        let mut candidate = self.settings_candidate();
+        update(&mut candidate);
+        let saved = self.commit_settings(candidate).is_ok();
+        cx.notify();
+        saved
+    }
+
+    fn set_double_tap_lock(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.update_settings(cx, |settings| {
+            settings.double_tap_lock = enabled;
+            if !enabled {
+                settings.double_tap_only = false;
+            }
+        }) {
+            self.double_tap_toggle.set_enabled(enabled);
+        }
+    }
+
+    fn set_double_tap_only(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.update_settings(cx, |settings| {
+            settings.double_tap_only =
+                enabled && settings.double_tap_lock && settings.dictation_hotkey.key.is_some();
+        });
     }
 
     fn processing_input(
@@ -4223,42 +4302,96 @@ impl AppWindow {
         }
     }
 
-    fn processing_inputs(settings: &AppSettings, cx: &mut Context<Self>) -> ProcessingInputs {
+    fn mode_editor(mode: &DictationMode, cx: &mut Context<Self>) -> ModeEditor {
+        ModeEditor {
+            settings: mode.clone(),
+            inputs: Self::mode_inputs(mode, cx),
+        }
+    }
+
+    fn mode_editors(settings: &AppSettings, cx: &mut Context<Self>) -> ModeEditors {
         let processing = &settings.dictation_processing;
-        ProcessingInputs {
-            default_mode: Self::mode_inputs(&processing.default_mode, cx),
+        ModeEditors {
+            default_mode: Self::mode_editor(&processing.default_mode, cx),
             modes: processing
                 .modes
                 .iter()
-                .map(|mode| Self::mode_inputs(mode, cx))
+                .map(|mode| Self::mode_editor(mode, cx))
                 .collect(),
         }
     }
 
     fn sync_processing_settings(&mut self, cx: &mut Context<Self>) {
-        apply_mode_inputs(
-            &self.processing_inputs.default_mode,
-            &mut self.settings.dictation_processing.default_mode,
-            true,
-            cx,
-        );
-        for (inputs, mode) in self
-            .processing_inputs
-            .modes
-            .iter()
-            .zip(&mut self.settings.dictation_processing.modes)
-        {
-            apply_mode_inputs(inputs, mode, false, cx);
+        let row = &mut self.mode_editors.default_mode;
+        apply_mode_inputs(&row.inputs, &mut row.settings, true, cx);
+        for row in &mut self.mode_editors.modes {
+            apply_mode_inputs(&row.inputs, &mut row.settings, false, cx);
         }
         self.schedule_settings_save(cx);
+    }
+
+    fn update_mode_settings(
+        &mut self,
+        selection: ModeSelection,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut DictationMode),
+    ) -> bool {
+        let mut candidate = self.settings_candidate();
+        let mode = match selection {
+            ModeSelection::Default => &mut candidate.dictation_processing.default_mode,
+            ModeSelection::Custom(index) => &mut candidate.dictation_processing.modes[index],
+        };
+        update(mode);
+        let mode = mode.clone();
+        let saved = self.commit_settings(candidate).is_ok();
+        if saved {
+            self.mode_editor_mut(selection).settings = mode;
+        }
+        cx.notify();
+        saved
+    }
+
+    fn add_mode(&mut self, cx: &mut Context<Self>) -> Option<ModeSelection> {
+        let mut mode = self.mode_editors.default_mode.settings.clone();
+        mode.name = format!("Mode {}", self.mode_editors.modes.len() + 1);
+        mode.applications.clear();
+        mode.browser_hosts.clear();
+        let mut candidate = self.settings_candidate();
+        candidate.dictation_processing.modes.push(mode.clone());
+        let saved = self.commit_settings(candidate).is_ok();
+        cx.notify();
+        if !saved {
+            return None;
+        }
+        let selection = ModeSelection::Custom(self.mode_editors.modes.len());
+        self.mode_editors.modes.push(Self::mode_editor(&mode, cx));
+        Some(selection)
+    }
+
+    fn delete_mode(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.mode_editors.modes.len() {
+            return;
+        }
+        let mut candidate = self.settings_candidate();
+        candidate.dictation_processing.modes.remove(index);
+        if self.commit_settings(candidate).is_ok() {
+            self.mode_editors.modes.remove(index);
+            self.selected_mode = ModeSelection::Default;
+            self.mode_delete_armed = false;
+            self.variant_picker_open = None;
+            self.application_picker_open = false;
+            self.transformation_picker_open = false;
+        }
+        cx.notify();
     }
 
     fn schedule_settings_save(&mut self, cx: &mut Context<Self>) {
         self.settings_dirty = true;
         self.settings_save_generation = self.settings_save_generation.wrapping_add(1);
         let generation = self.settings_save_generation;
+        let delay = cx.background_executor().timer(Duration::from_millis(250));
         cx.spawn(async move |window, cx| {
-            Timer::after(Duration::from_millis(250)).await;
+            delay.await;
             let _ = window.update(cx, |window, cx| {
                 if window.settings_save_generation == generation {
                     window.save_settings(cx);
@@ -4277,19 +4410,9 @@ impl AppWindow {
             .border_color(rgb(LINE))
             .bg(rgb(SURFACE))
             .on_click(cx.listener(|this, _, window, cx| {
-                let mut mode = this.settings.dictation_processing.default_mode.clone();
-                mode.name = format!("Mode {}", this.processing_inputs.modes.len() + 1);
-                mode.applications.clear();
-                mode.browser_hosts.clear();
-                let mode = DictationMode { ..mode };
-                this.processing_inputs
-                    .modes
-                    .push(Self::mode_inputs(&mode, cx));
-                this.settings.dictation_processing.modes.push(mode);
-                let selection =
-                    ModeSelection::Custom(this.processing_inputs.modes.len().saturating_sub(1));
-                this.select_mode(selection, window, cx);
-                this.sync_processing_settings(cx);
+                if let Some(selection) = this.add_mode(cx) {
+                    this.select_mode(selection, window, cx);
+                }
             }));
         let default_selected = self.selected_mode == ModeSelection::Default;
         let mut rows = vec![
@@ -4308,13 +4431,13 @@ impl AppWindow {
             .into_any_element(),
         ];
         rows.extend(
-            self.processing_inputs
+            self.mode_editors
                 .modes
                 .iter()
                 .enumerate()
-                .map(|(index, inputs)| {
-                    let name = input_text(&inputs.name, cx);
-                    let mode = &self.settings.dictation_processing.modes[index];
+                .map(|(index, row)| {
+                    let name = input_text(&row.inputs.name, cx);
+                    let mode = &row.settings;
                     let selected = self.selected_mode == ModeSelection::Custom(index);
                     mode_row(
                         name,
@@ -4509,11 +4632,13 @@ impl AppWindow {
             .when(processing_can_toggle, |control| {
                 control.on_click(cx.listener(move |this, _, _, cx| {
                     let enabled = !this.selected_mode_settings().post_processing.enabled;
-                    this.selected_mode_inputs_mut()
-                        .processing_toggle
-                        .set_enabled(enabled);
-                    this.selected_mode_settings_mut().post_processing.enabled = enabled;
-                    this.save_settings(cx);
+                    if this.update_mode_settings(this.selected_mode, cx, |mode| {
+                        mode.post_processing.enabled = enabled;
+                    }) {
+                        this.selected_mode_inputs_mut()
+                            .processing_toggle
+                            .set_enabled(enabled);
+                    }
                 }))
             })
             .into_any_element();
@@ -4613,13 +4738,7 @@ impl AppWindow {
                                     let ModeSelection::Custom(index) = this.selected_mode else {
                                         return;
                                     };
-                                    if index < this.processing_inputs.modes.len() {
-                                        this.processing_inputs.modes.remove(index);
-                                        this.settings.dictation_processing.modes.remove(index);
-                                        this.selected_mode = ModeSelection::Default;
-                                        this.mode_delete_armed = false;
-                                        this.save_settings(cx);
-                                    }
+                                    this.delete_mode(index, cx);
                                 })),
                         )
                         .into_any_element()
@@ -4722,12 +4841,13 @@ impl AppWindow {
                         if drag.selection != selection {
                             return;
                         }
-                        let transformations =
-                            &mut this.mode_settings_mut(selection).transformations;
-                        if !reorder_transformation(transformations, &drag.id, target_index) {
-                            return;
-                        }
-                        this.save_settings(cx);
+                        this.update_mode_settings(selection, cx, |mode| {
+                            reorder_transformation(
+                                &mut mode.transformations,
+                                &drag.id,
+                                target_index,
+                            );
+                        });
                     }))
                     .child(
                         div()
@@ -4763,10 +4883,10 @@ impl AppWindow {
                             .text_size(px(14.0))
                             .text_color(rgb(MUTED))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mode_settings_mut(selection)
-                                    .transformations
-                                    .retain(|candidate| candidate != &dragged_id);
-                                this.save_settings(cx);
+                                this.update_mode_settings(selection, cx, |mode| {
+                                    mode.transformations
+                                        .retain(|candidate| candidate != &dragged_id);
+                                });
                             })),
                     )
                     .into_any_element()
@@ -4822,10 +4942,9 @@ impl AppWindow {
                                 .child("Add"),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mode_settings_mut(selection)
-                                .transformations
-                                .push(id.clone());
-                            this.save_settings(cx);
+                            this.update_mode_settings(selection, cx, |mode| {
+                                mode.transformations.push(id.clone());
+                            });
                         }))
                         .into_any_element()
                 })
@@ -5187,15 +5306,15 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         if let Some(conflict) = self
-            .settings
-            .dictation_processing
+            .mode_editors
             .modes
             .iter()
             .enumerate()
-            .find(|(index, mode)| {
-                selection != ModeSelection::Custom(*index) && mode.applications.contains(&name)
+            .find(|(index, row)| {
+                selection != ModeSelection::Custom(*index)
+                    && row.settings.applications.contains(&name)
             })
-            .map(|(_, mode)| mode.name.clone())
+            .map(|(_, row)| row.settings.name.clone())
         {
             self.application_picker_error = Some(format!(
                 "{name} already activates {conflict}. Remove it there before reassigning it."
@@ -5203,16 +5322,17 @@ impl AppWindow {
             cx.notify();
             return;
         }
-        let applications = &mut self.mode_settings_mut(selection).applications;
-        if !applications.contains(&name) {
-            applications.push(name);
-            applications.sort_by_key(|name| name.to_lowercase());
+        if !self.mode_settings(selection).applications.contains(&name)
+            && self.update_mode_settings(selection, cx, |mode| {
+                mode.applications.push(name);
+                mode.applications.sort_by_key(|name| name.to_lowercase());
+            })
+        {
             self.application_picker_highlight = 0;
             self.application_search
                 .entity
                 .update(cx, |input, cx| input.set_text("", cx));
             self.application_picker_error = None;
-            self.save_settings(cx);
         }
     }
 
@@ -5222,10 +5342,9 @@ impl AppWindow {
         name: &str,
         cx: &mut Context<Self>,
     ) {
-        self.mode_settings_mut(selection)
-            .applications
-            .retain(|application| application != name);
-        self.save_settings(cx);
+        self.update_mode_settings(selection, cx, |mode| {
+            mode.applications.retain(|application| application != name);
+        });
     }
 
     fn choose_application(&mut self, selection: ModeSelection, cx: &mut Context<Self>) {
@@ -5708,20 +5827,22 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         let text = model.clone().unwrap_or_default();
-        self.model_input_for(target)
-            .update(cx, |input, cx| input.set_text(text, cx));
-        match target {
+        let saved = match target {
             ModelPickerTarget::Mode(selection) => {
-                let processing = &mut self.mode_settings_mut(selection).post_processing;
-                processing.model = model;
-                processing.variant = None;
+                self.update_mode_settings(selection, cx, |mode| {
+                    mode.post_processing.model = model;
+                    mode.post_processing.variant = None;
+                })
             }
-            ModelPickerTarget::VoiceAction => {
-                self.settings.voice_action.model = model;
-                self.settings.voice_action.variant = None;
-            }
+            ModelPickerTarget::VoiceAction => self.update_settings(cx, |settings| {
+                settings.voice_action.model = model;
+                settings.voice_action.variant = None;
+            }),
+        };
+        if saved {
+            self.model_input_for(target)
+                .update(cx, |input, cx| input.set_text(text, cx));
         }
-        self.save_settings(cx);
     }
 
     fn set_model_variant(
@@ -5730,8 +5851,19 @@ impl AppWindow {
         variant: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        apply_model_variant(&mut self.settings, target, variant, &self.model_catalog);
-        self.save_settings(cx);
+        let mut candidate = self.settings_candidate();
+        apply_model_variant(&mut candidate, target, variant, &self.model_catalog);
+        if self.commit_settings(candidate).is_ok()
+            && let ModelPickerTarget::Mode(selection) = target
+        {
+            let mode = match selection {
+                ModeSelection::Default => &self.settings.dictation_processing.default_mode,
+                ModeSelection::Custom(index) => &self.settings.dictation_processing.modes[index],
+            }
+            .clone();
+            self.mode_editor_mut(selection).settings = mode;
+        }
+        cx.notify();
     }
 
     fn model_input_for(&self, target: ModelPickerTarget) -> Entity<TextInput> {
@@ -5787,38 +5919,32 @@ impl AppWindow {
     }
 
     fn mode_inputs_mut(&mut self, selection: ModeSelection) -> &mut ModeInputs {
-        match selection {
-            ModeSelection::Default => &mut self.processing_inputs.default_mode,
-            ModeSelection::Custom(index) => &mut self.processing_inputs.modes[index],
-        }
+        &mut self.mode_editor_mut(selection).inputs
     }
 
     fn mode_inputs_for(&self, selection: ModeSelection) -> &ModeInputs {
-        match selection {
-            ModeSelection::Default => &self.processing_inputs.default_mode,
-            ModeSelection::Custom(index) => &self.processing_inputs.modes[index],
-        }
+        &self.mode_editor_for(selection).inputs
     }
 
     fn selected_mode_settings(&self) -> &DictationMode {
         self.mode_settings(self.selected_mode)
     }
 
-    fn selected_mode_settings_mut(&mut self) -> &mut DictationMode {
-        self.mode_settings_mut(self.selected_mode)
+    fn mode_settings(&self, selection: ModeSelection) -> &DictationMode {
+        &self.mode_editor_for(selection).settings
     }
 
-    fn mode_settings(&self, selection: ModeSelection) -> &DictationMode {
+    fn mode_editor_for(&self, selection: ModeSelection) -> &ModeEditor {
         match selection {
-            ModeSelection::Default => &self.settings.dictation_processing.default_mode,
-            ModeSelection::Custom(index) => &self.settings.dictation_processing.modes[index],
+            ModeSelection::Default => &self.mode_editors.default_mode,
+            ModeSelection::Custom(index) => &self.mode_editors.modes[index],
         }
     }
 
-    fn mode_settings_mut(&mut self, selection: ModeSelection) -> &mut DictationMode {
+    fn mode_editor_mut(&mut self, selection: ModeSelection) -> &mut ModeEditor {
         match selection {
-            ModeSelection::Default => &mut self.settings.dictation_processing.default_mode,
-            ModeSelection::Custom(index) => &mut self.settings.dictation_processing.modes[index],
+            ModeSelection::Default => &mut self.mode_editors.default_mode,
+            ModeSelection::Custom(index) => &mut self.mode_editors.modes[index],
         }
     }
 
@@ -7115,11 +7241,13 @@ impl Drop for AppWindow {
     fn drop(&mut self) {
         if !self.preview
             && self.settings_dirty
-            && let Err(error) = self.settings.save()
+            && let Err(error) = self.settings_candidate().save()
         {
             tracing::error!(%error, "could not flush app settings while closing window");
         }
-        crate::app_settings::set_hotkey_capture_active(false);
+        if !self.preview {
+            crate::app_settings::set_hotkey_capture_active(false);
+        }
     }
 }
 
@@ -7148,105 +7276,6 @@ impl TranscriptionPickerDelegate for AppWindow {
             self.clear_transcription_error();
             cx.notify();
         }
-    }
-}
-
-impl DesktopHost for AppWindow {
-    fn capabilities(&self) -> DesktopCapabilities {
-        DesktopCapabilities::macos(crate::DEVELOPER_FEATURES_ENABLED)
-    }
-
-    fn snapshot(&self) -> DesktopSnapshot {
-        let update_status = match self.update_status {
-            crate::sparkle::UpdateStatus::Unavailable => DesktopUpdateStatus::Unavailable,
-            crate::sparkle::UpdateStatus::Checking => DesktopUpdateStatus::Checking,
-            crate::sparkle::UpdateStatus::Idle | crate::sparkle::UpdateStatus::UpToDate => {
-                DesktopUpdateStatus::Current
-            }
-            crate::sparkle::UpdateStatus::UpdateAvailable => DesktopUpdateStatus::Available,
-        };
-        DesktopSnapshot {
-            activity: self.activity.clone(),
-            dictation_shortcut: self.settings.dictation_hotkey.keycaps(),
-            double_tap_lock: self.settings.double_tap_lock,
-            double_tap_only: self.settings.double_tap_only,
-            listener: None,
-            operation_error: self.settings_load_error.clone(),
-            transcription: DesktopTranscriptionSnapshot {
-                downloaded_bytes: self.transcription_downloaded_bytes,
-                error: self.transcription_picker_error.clone(),
-                preparation_stage: None,
-                selection: self.settings.transcription.clone(),
-                preparing: self.transcription_downloading,
-            },
-            update_status,
-        }
-    }
-
-    fn dispatch(&mut self, action: DesktopAction) -> color_eyre::Result<()> {
-        match action {
-            DesktopAction::ClearError => {}
-            DesktopAction::RestartIntoUpdate
-            | DesktopAction::StartListening
-            | DesktopAction::StopListening => {
-                return Err(color_eyre::eyre::eyre!(
-                    "desktop action is unavailable on this host"
-                ));
-            }
-            DesktopAction::SetDictationShortcut(shortcut) => {
-                let modifiers = HotkeyModifiers {
-                    control: shortcut.control.then_some(Default::default()),
-                    option: shortcut.alt.then_some(Default::default()),
-                    shift: shortcut.shift.then_some(Default::default()),
-                    command: shortcut.platform.then_some(Default::default()),
-                    function: shortcut.function,
-                };
-                let key = if shortcut.key.is_empty() {
-                    None
-                } else {
-                    Some(
-                        hotkey_key(&shortcut.key)
-                            .map_err(|message| color_eyre::eyre::eyre!(message))?,
-                    )
-                };
-                let binding = HotkeyBinding { modifiers, key };
-                if binding.is_empty() {
-                    return Err(color_eyre::eyre::eyre!("shortcut cannot be empty"));
-                }
-                if binding.key.is_some()
-                    && binding.modifiers.is_empty()
-                    && !binding
-                        .key
-                        .as_ref()
-                        .is_some_and(|key| is_function_key(&key.label))
-                {
-                    return Err(color_eyre::eyre::eyre!("shortcut requires a modifier"));
-                }
-                if hotkey_binding_conflicts(&self.settings, HotkeyKind::Dictation, &binding) {
-                    return Err(color_eyre::eyre::eyre!("shortcut is already in use"));
-                }
-                let mut candidate = self.settings.clone();
-                candidate.dictation_hotkey = binding;
-                self.commit_settings(candidate)?;
-            }
-            DesktopAction::SetDoubleTapLock(enabled) => {
-                let mut candidate = self.settings.clone();
-                candidate.double_tap_lock = enabled;
-                if !enabled {
-                    candidate.double_tap_only = false;
-                }
-                self.commit_settings(candidate)?;
-                self.double_tap_toggle.set_enabled(enabled);
-            }
-            DesktopAction::SetDoubleTapOnly(enabled) => {
-                let mut candidate = self.settings.clone();
-                candidate.double_tap_only = enabled
-                    && candidate.double_tap_lock
-                    && candidate.dictation_hotkey.key.is_some();
-                self.commit_settings(candidate)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -7338,6 +7367,15 @@ impl Render for AppWindow {
                     .flex_col()
                     .overflow_hidden()
                     .children(model_notice)
+                    .when_some(self.settings_load_error.clone(), |column, error| {
+                        column.child(
+                            div()
+                                .px_5()
+                                .py_2()
+                                .debug_selector(|| "settings-error".into())
+                                .child(error_message("Settings error:", error)),
+                        )
+                    })
                     .child(div().flex_1().min_h_0().child(content)),
             )
             .children(setup)
@@ -8026,10 +8064,14 @@ fn apply_mode_inputs(inputs: &ModeInputs, mode: &mut DictationMode, is_default: 
     } else {
         browser_hosts(&input_text(&inputs.browser_hosts, cx))
     };
-    for (inputs, replacement) in inputs.replacements.iter().zip(&mut mode.replacements) {
-        replacement.matched_phrase = inputs.matched_phrase.entity.read(cx).text().to_string();
-        replacement.output = inputs.output.entity.read(cx).text().to_string();
-    }
+    mode.replacements = inputs
+        .replacements
+        .iter()
+        .map(|inputs| TextReplacement {
+            matched_phrase: inputs.matched_phrase.entity.read(cx).text().to_string(),
+            output: inputs.output.entity.read(cx).text().to_string(),
+        })
+        .collect();
     mode.post_processing.enabled = inputs.processing_toggle.enabled();
     mode.post_processing.prompt = input_text(&inputs.prompt, cx);
     mode.post_processing.deadline_seconds = input_text(&inputs.deadline, cx)
@@ -8512,6 +8554,222 @@ mod tests {
 
     use super::*;
     use crate::personal_commands::StatusExecution;
+
+    fn editor_fixture(window: &mut Window, cx: &mut Context<AppWindow>) -> AppWindow {
+        AppWindow::new(
+            PathBuf::from("unused-preview-events.ndjson"),
+            crate::config::voice_control(),
+            sync_channel(1).0,
+            crate::dictation_indicator::channel().0,
+            None,
+            None,
+            Some(AppWindowPreview {
+                pane: DeveloperPane::Modes,
+                transcription_picker: None,
+                onboarding: false,
+                collapse_mode_processing: true,
+                open_transformation_picker: false,
+                select_global_mode: true,
+                voice_action_enabled: false,
+                opencode_unavailable: true,
+                permissions_missing: false,
+                model_missing: false,
+                command_model_missing: false,
+                open_history_retention: false,
+                confirm_release_microphone: false,
+                update_available: false,
+            }),
+            window,
+            cx,
+        )
+    }
+
+    fn reject_settings_save(_: &AppSettings) -> color_eyre::Result<()> {
+        Err(color_eyre::eyre::eyre!("fixture persistence failure"))
+    }
+
+    #[gpui::test]
+    fn failed_shortcut_save_stays_in_capture_and_preserves_pending_edits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(editor_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.settings.transcription.recognition_hints = "Unsaved vocabulary".into();
+                view.schedule_settings_save(cx);
+                let generation = view.settings_save_generation;
+                let before = serde_json::to_value(&view.settings).unwrap();
+                view.settings_save_override = Some(reject_settings_save);
+                view.hotkey_capture = HotkeyCaptureState::Listening {
+                    kind: HotkeyKind::Dictation,
+                    modifiers: HotkeyModifiers::default(),
+                    message: None,
+                    started_at: Instant::now(),
+                };
+                let binding = HotkeyBinding {
+                    modifiers: HotkeyModifiers {
+                        control: Some(ModifierSide::Either),
+                        ..Default::default()
+                    },
+                    key: None,
+                };
+                view.save_hotkey_binding(binding.clone(), cx);
+                assert!(view.hotkey_capture.is_listening());
+                assert_eq!(serde_json::to_value(&view.settings).unwrap(), before);
+                assert!(view.settings_dirty);
+                assert_eq!(view.settings_save_generation, generation);
+                assert_eq!(
+                    view.settings_load_error.as_deref(),
+                    Some("fixture persistence failure")
+                );
+
+                // An immediate retry commits the unrelated draft as well, and only
+                // then ends capture and invalidates the earlier debounce.
+                view.settings_save_override = None;
+                view.save_hotkey_binding(binding.clone(), cx);
+                assert!(matches!(
+                    view.hotkey_capture,
+                    HotkeyCaptureState::Saved { .. }
+                ));
+                assert_eq!(view.settings.dictation_hotkey, binding);
+                assert_eq!(
+                    view.settings.transcription.recognition_hints,
+                    "Unsaved vocabulary"
+                );
+                assert!(!view.settings_dirty);
+                assert_ne!(view.settings_save_generation, generation);
+                assert!(view.settings_load_error.is_none());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn failed_retention_save_keeps_previous_choice_and_reports_the_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(editor_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.settings_save_override = Some(reject_settings_save);
+                view.set_history_retention(HistoryRetention::Off, cx);
+                assert_eq!(view.settings.history_retention, HistoryRetention::Week);
+                assert_eq!(
+                    view.settings_load_error.as_deref(),
+                    Some("fixture persistence failure")
+                );
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("settings-error").is_some());
+    }
+
+    #[gpui::test]
+    fn mode_rows_preserve_edits_across_add_delete_and_supersede_old_debounces(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(editor_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let name = view
+                    .mode_inputs_for(ModeSelection::Custom(0))
+                    .name
+                    .entity
+                    .clone();
+                name.update(cx, |input, cx| input.set_text("Pending mode name", cx));
+                view.sync_processing_settings(cx);
+                assert!(view.settings_dirty);
+                let pending_generation = view.settings_save_generation;
+
+                view.settings_save_override = Some(reject_settings_save);
+                assert!(view.add_mode(cx).is_none());
+                view.delete_mode(0, cx);
+                assert_eq!(view.mode_editors.modes.len(), 1);
+                assert_eq!(
+                    view.settings_candidate().dictation_processing.modes[0].name,
+                    "Pending mode name"
+                );
+                assert_eq!(
+                    view.settings.dictation_processing.modes[0].name,
+                    "Work notes"
+                );
+                assert_eq!(view.settings_save_generation, pending_generation);
+
+                view.settings_save_override = None;
+                assert!(view.add_mode(cx) == Some(ModeSelection::Custom(1)));
+                assert_eq!(view.mode_editors.modes.len(), 2);
+                assert_eq!(
+                    view.settings.dictation_processing.modes[0].name,
+                    "Pending mode name"
+                );
+                let second_name = view
+                    .mode_inputs_for(ModeSelection::Custom(1))
+                    .name
+                    .entity
+                    .clone();
+                second_name.update(cx, |input, cx| input.set_text("Survivor", cx));
+                view.sync_processing_settings(cx);
+                view.delete_mode(0, cx);
+                assert_eq!(view.mode_editors.modes.len(), 1);
+                assert_eq!(
+                    view.mode_settings(ModeSelection::Custom(0)).name,
+                    "Survivor"
+                );
+                assert_eq!(view.settings.dictation_processing.modes[0].name, "Survivor");
+                assert!(!view.settings_dirty);
+                view.select_model(
+                    ModelPickerTarget::Mode(ModeSelection::Custom(0)),
+                    Some("example/writer".into()),
+                    cx,
+                );
+
+                // If either obsolete debounce writes, the injected failure becomes
+                // visible and makes the assertions below fail.
+                view.settings_save_override = Some(reject_settings_save);
+            })
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.settings_load_error.is_none());
+                assert!(!view.settings_dirty);
+                let name = view
+                    .mode_inputs_for(ModeSelection::Custom(0))
+                    .name
+                    .entity
+                    .clone();
+                name.update(cx, |input, cx| input.set_text("Later draft", cx));
+                view.sync_processing_settings(cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                assert!(view.settings_dirty);
+                assert_eq!(
+                    view.settings_load_error.as_deref(),
+                    Some("fixture persistence failure")
+                );
+                assert_eq!(
+                    view.settings_candidate().dictation_processing.modes[0].name,
+                    "Later draft"
+                );
+                assert_eq!(view.settings.dictation_processing.modes[0].name, "Survivor");
+                assert_eq!(
+                    view.settings.dictation_processing.modes[0]
+                        .post_processing
+                        .model
+                        .as_deref(),
+                    Some("example/writer")
+                );
+            })
+        });
+    }
 
     #[gpui::test]
     fn settings_content_stays_inside_the_pane_at_supported_widths(cx: &mut gpui::TestAppContext) {

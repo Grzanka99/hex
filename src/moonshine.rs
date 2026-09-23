@@ -351,10 +351,14 @@ pub struct RecognitionWord {
 pub struct Moonshine {
     functions: Functions,
     transcriber: c_int,
-    streams: Vec<c_int>,
-    stream_active: Vec<bool>,
+    streams: Vec<StreamRecord>,
     // Function pointers above remain valid only while this library is loaded.
     _library: Library,
+}
+
+struct StreamRecord {
+    handle: c_int,
+    active: bool,
 }
 
 impl Moonshine {
@@ -461,7 +465,6 @@ impl Moonshine {
                 functions,
                 transcriber,
                 streams: Vec::with_capacity(stream_count),
-                stream_active: Vec::with_capacity(stream_count),
                 _library: library,
             };
             let opened = (0..stream_count).try_for_each(|_| moonshine.open_stream());
@@ -477,14 +480,16 @@ impl Moonshine {
     unsafe fn open_stream(&mut self) -> Result<()> {
         let stream = unsafe { (self.functions.create_stream)(self.transcriber, 0) };
         check_handle(&self.functions, stream, "create stream")?;
-        self.streams.push(stream);
-        self.stream_active.push(false);
+        self.streams.push(StreamRecord {
+            handle: stream,
+            active: false,
+        });
         let started = unsafe { (self.functions.start_stream)(self.transcriber, stream) };
         check(&self.functions, started, "start stream")?;
-        *self
-            .stream_active
+        self.streams
             .last_mut()
-            .expect("stream was just registered") = true;
+            .expect("stream was just registered")
+            .active = true;
         Ok(())
     }
 
@@ -528,10 +533,10 @@ impl Moonshine {
     pub fn finish_stream(&mut self, stream_index: usize) -> Result<Vec<RecognitionUpdate>> {
         let stream = self.stream(stream_index)?;
         let _native = read_native();
-        if self.stream_active[stream_index] {
+        if self.streams[stream_index].active {
             let stop = unsafe { (self.functions.stop_stream)(self.transcriber, stream) };
             check(&self.functions, stop, "stop stream")?;
-            self.stream_active[stream_index] = false;
+            self.streams[stream_index].active = false;
         }
         let mut updates = self.read_transcript(stream, FORCE_UPDATE)?;
         updates.extend(self.read_transcript(stream, 0)?);
@@ -640,8 +645,10 @@ impl Moonshine {
                 (self.functions.free_stream)(self.transcriber, current),
                 "free stream",
             );
-            self.streams[stream_index] = replacement;
-            self.stream_active[stream_index] = true;
+            self.streams[stream_index] = StreamRecord {
+                handle: replacement,
+                active: true,
+            };
             free_result
         }
     }
@@ -649,7 +656,7 @@ impl Moonshine {
     fn stream(&self, index: usize) -> Result<c_int> {
         self.streams
             .get(index)
-            .copied()
+            .map(|stream| stream.handle)
             .ok_or_else(|| eyre!("Moonshine stream {index} does not exist"))
     }
 }
@@ -660,12 +667,7 @@ impl Drop for Moonshine {
         // errors because there is no recovery path during destruction.
         let _native = write_native();
         unsafe {
-            free_streams(
-                &self.functions,
-                self.transcriber,
-                &self.streams,
-                &self.stream_active,
-            );
+            free_streams(&self.functions, self.transcriber, &self.streams);
             (self.functions.free_transcriber)(self.transcriber);
         }
     }
@@ -683,18 +685,13 @@ fn write_native() -> RwLockWriteGuard<'static, ()> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
-unsafe fn free_streams(
-    functions: &Functions,
-    transcriber: c_int,
-    streams: &[c_int],
-    active: &[bool],
-) {
-    for (&stream, &active) in streams.iter().zip(active) {
+unsafe fn free_streams(functions: &Functions, transcriber: c_int, streams: &[StreamRecord]) {
+    for stream in streams {
         unsafe {
-            if active {
-                (functions.stop_stream)(transcriber, stream);
+            if stream.active {
+                (functions.stop_stream)(transcriber, stream.handle);
             }
-            (functions.free_stream)(transcriber, stream);
+            (functions.free_stream)(transcriber, stream.handle);
         }
     }
 }
@@ -762,9 +759,92 @@ fn error_message(functions: &Functions, code: c_int) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs::OpenOptions;
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cleanup_frees_inactive_streams_without_stopping_them() {
+        thread_local! {
+            static CALLS: RefCell<Vec<(&'static str, c_int, c_int)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn stop(transcriber: c_int, stream: c_int) -> c_int {
+            CALLS.with_borrow_mut(|calls| calls.push(("stop", transcriber, stream)));
+            -1 // A failed stop must not prevent freeing this or later streams.
+        }
+        unsafe extern "C" fn free(transcriber: c_int, stream: c_int) -> c_int {
+            CALLS.with_borrow_mut(|calls| calls.push(("free", transcriber, stream)));
+            0
+        }
+        unsafe extern "C" fn version() -> c_int {
+            HEADER_VERSION
+        }
+        unsafe extern "C" fn free_transcriber(_: c_int) {}
+        unsafe extern "C" fn create(_: c_int, _: c_uint) -> c_int {
+            0
+        }
+        unsafe extern "C" fn add(
+            _: c_int,
+            _: c_int,
+            _: *const c_float,
+            _: c_ulonglong,
+            _: c_int,
+            _: c_uint,
+        ) -> c_int {
+            0
+        }
+        unsafe extern "C" fn transcribe(
+            _: c_int,
+            _: c_int,
+            _: c_uint,
+            _: *mut *mut Transcript,
+        ) -> c_int {
+            0
+        }
+        unsafe extern "C" fn error(_: c_int) -> *const c_char {
+            ptr::null()
+        }
+        let functions = Functions {
+            get_version: version,
+            free_transcriber,
+            create_stream: create,
+            free_stream: free,
+            start_stream: stop,
+            stop_stream: stop,
+            add_audio: add,
+            transcribe_stream: transcribe,
+            error_to_string: error,
+        };
+        let streams = [
+            StreamRecord {
+                handle: 10,
+                active: true,
+            },
+            StreamRecord {
+                handle: 20,
+                active: false,
+            },
+            StreamRecord {
+                handle: 30,
+                active: true,
+            },
+        ];
+        // Only fixture callbacks run; no native handles or library are opened.
+        unsafe { free_streams(&functions, 7, &streams) };
+        CALLS.with_borrow(|calls| {
+            assert_eq!(
+                calls.as_slice(),
+                &[
+                    ("stop", 7, 10),
+                    ("free", 7, 10),
+                    ("free", 7, 20),
+                    ("stop", 7, 30),
+                    ("free", 7, 30),
+                ]
+            )
+        });
+    }
 
     #[test]
     fn native_structs_match_the_moonshine_lp64_abi() {

@@ -1,6 +1,9 @@
+#[cfg(target_os = "linux")]
 use color_eyre::Result;
 
+#[cfg(target_os = "linux")]
 use crate::desktop_activity::DesktopActivity;
+#[cfg(target_os = "linux")]
 use crate::transcription_models::{
     ModelPreparationStage, TranscriptionModelId, TranscriptionSelection,
 };
@@ -36,7 +39,7 @@ impl DesktopCapabilities {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     pub(crate) const fn linux_x11() -> Self {
         Self {
             activity: false,
@@ -53,6 +56,7 @@ impl DesktopCapabilities {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopSnapshot {
     pub(crate) activity: DesktopActivity,
@@ -65,6 +69,7 @@ pub(crate) struct DesktopSnapshot {
     pub(crate) update_status: DesktopUpdateStatus,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopTranscriptionSnapshot {
     pub(crate) downloaded_bytes: u64,
@@ -74,23 +79,24 @@ pub(crate) struct DesktopTranscriptionSnapshot {
     pub(crate) preparing: Option<TranscriptionModelId>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopListenerSnapshot {
     pub(crate) running: bool,
     pub(crate) status: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DesktopUpdateStatus {
     Unavailable,
     Checking,
     Current,
     Failed,
-    #[cfg(target_os = "macos")]
-    Available,
     ReadyToRestart,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopShortcut {
     pub(crate) alt: bool,
@@ -101,6 +107,7 @@ pub(crate) struct DesktopShortcut {
     pub(crate) shift: bool,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DesktopAction {
     ClearError,
@@ -112,16 +119,15 @@ pub(crate) enum DesktopAction {
     StopListening,
 }
 
+/// Contract between the Linux Settings client and its service-owned runtime.
+#[cfg(target_os = "linux")]
 pub(crate) trait DesktopHost {
     fn capabilities(&self) -> DesktopCapabilities;
-    /// Only the contained Linux root reads the portable snapshot; the macOS
-    /// root reads its own settings and activity directly.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn snapshot(&self) -> DesktopSnapshot;
     fn dispatch(&mut self, action: DesktopAction) -> Result<()>;
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

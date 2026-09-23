@@ -103,7 +103,9 @@ pub fn run(shutdown: &'static AtomicBool) -> Result<()> {
         }
         Command::Dictate { device } => {
             let _instance = crate::instance::acquire("listener")?;
-            crate::linux_dictation::run(&event_path, device.as_deref(), shutdown, None)
+            let settings = crate::linux_settings::LinuxSettings::load()?;
+            crate::linux_dictation::initialize_feedback(settings.sound_effect_volume);
+            crate::linux_dictation::run(&event_path, device.as_deref(), shutdown, settings, None)
         }
         Command::Devices => {
             for device in crate::audio::input_device_names()? {

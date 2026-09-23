@@ -636,6 +636,17 @@ impl AppSettings {
         crate::transcription_models::validate(&selection)?;
         let mut candidate = self.clone();
         candidate.remember_transcription(selection);
+        self.commit_with(candidate, save)
+    }
+
+    /// Persist the entire candidate before replacing the current editor value.
+    /// The candidate may include unrelated debounced edits, which must survive
+    /// both failed immediate changes and successful commits.
+    pub(crate) fn commit_with(
+        &mut self,
+        candidate: Self,
+        save: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
         save(&candidate)?;
         *self = candidate;
         Ok(())

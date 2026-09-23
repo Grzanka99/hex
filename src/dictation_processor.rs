@@ -195,53 +195,52 @@ impl Profiles {
             transformations: profile.transformations.clone(),
         }
     }
+}
 
-    pub fn process_voice_action_cancellable(
-        &self,
-        instruction: &str,
-        selected_text: Option<&str>,
-        context: &ContextSnapshot,
-        cancelled: &AtomicBool,
-    ) -> Processed {
-        let settings = crate::app_settings::voice_action_settings();
-        let prompt = voice_action_prompt(instruction, selected_text, context);
-        let deadline = Duration::from_secs(settings.deadline_seconds.max(1));
-        let started = Instant::now();
-        let model = match settings.model.as_deref() {
-            None => None,
-            Some(key) => {
-                let Some((provider, id)) = key.split_once('/') else {
-                    return voice_action_failure(
-                        started,
-                        "Voice Action model must use provider/model format".into(),
-                    );
-                };
-                Some(Model {
-                    provider: provider.into(),
-                    id: id.into(),
-                    variant: settings.variant.clone(),
-                })
-            }
-        };
-        let (text, observation) = generate_observed(
-            &prompt,
-            model.as_ref(),
-            deadline,
-            cancelled,
-            VOICE_ACTION_PROFILE,
-            started,
+pub fn process_voice_action_cancellable(
+    instruction: &str,
+    selected_text: Option<&str>,
+    context: &ContextSnapshot,
+    cancelled: &AtomicBool,
+) -> Processed {
+    let settings = crate::app_settings::voice_action_settings();
+    let prompt = voice_action_prompt(instruction, selected_text, context);
+    let deadline = Duration::from_secs(settings.deadline_seconds.max(1));
+    let started = Instant::now();
+    let model = match settings.model.as_deref() {
+        None => None,
+        Some(key) => {
+            let Some((provider, id)) = key.split_once('/') else {
+                return voice_action_failure(
+                    started,
+                    "Voice Action model must use provider/model format".into(),
+                );
+            };
+            Some(Model {
+                provider: provider.into(),
+                id: id.into(),
+                variant: settings.variant.clone(),
+            })
+        }
+    };
+    let (text, observation) = generate_observed(
+        &prompt,
+        model.as_ref(),
+        deadline,
+        cancelled,
+        VOICE_ACTION_PROFILE,
+        started,
+    );
+    if observation.fallback.is_none() {
+        tracing::info!(
+            latency_ms = observation.latency_ms,
+            "voice action completed"
         );
-        if observation.fallback.is_none() {
-            tracing::info!(
-                latency_ms = observation.latency_ms,
-                "voice action completed"
-            );
-        }
-        Processed {
-            text: text.unwrap_or_default(),
-            observation: Some(observation),
-            transformations: Vec::new(),
-        }
+    }
+    Processed {
+        text: text.unwrap_or_default(),
+        observation: Some(observation),
+        transformations: Vec::new(),
     }
 }
 

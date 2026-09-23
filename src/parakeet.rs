@@ -21,7 +21,7 @@ use crate::history::{History, HistoryDraft, HistoryKind};
 use crate::meeting::{self, TranscriptEntry, TranscriptPublication};
 use crate::paste::{PasteMode, Paster};
 use crate::suppression::InputActivity;
-use crate::transcription::{Transcriber, WarmTranscriber};
+use crate::transcription::WarmTranscriber;
 use crate::transcription_models::{
     TranscriptionModelId, TranscriptionSelection, model_path, validate,
 };
@@ -479,25 +479,24 @@ fn run_processor_worker(
             let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
             continue;
         }
-        let profiles = crate::config::dictation_profiles();
-        if matches!(job.target, TranscriptionTarget::VoiceAction)
-            || profiles.processes(&job.context)
-        {
-            let _ = events.send(WorkerEvent::Stage {
-                job_id: job.job_id,
-                stage: DictationJobStage::Processing,
-            });
-        }
-        let mut processed = if matches!(job.target, TranscriptionTarget::VoiceAction) {
-            profiles.process_voice_action_cancellable(
-                &job.text,
-                job.context.selected_text.as_deref(),
-                &job.context,
-                &job.control.cancelled,
-            )
-        } else {
-            profiles.process_cancellable(&job.text, &job.context, &job.control.cancelled)
-        };
+        let mut processed = process_job_text(
+            &job,
+            crate::config::dictation_profiles,
+            || {
+                crate::dictation_processor::process_voice_action_cancellable(
+                    &job.text,
+                    job.context.selected_text.as_deref(),
+                    &job.context,
+                    &job.control.cancelled,
+                )
+            },
+            || {
+                let _ = events.send(WorkerEvent::Stage {
+                    job_id: job.job_id,
+                    stage: DictationJobStage::Processing,
+                });
+            },
+        );
         if !processed.transformations.is_empty() && !job.control.is_cancelled() {
             let started = Instant::now();
             let transformed = transformations.transform(
@@ -558,6 +557,26 @@ fn run_processor_worker(
     }
 }
 
+/// Select processing when the worker reaches the job, keeping Voice Action
+/// independent of mode snapshots. The stage precedes processing in either path.
+fn process_job_text(
+    job: &ProcessorJob,
+    profiles: impl FnOnce() -> crate::dictation_processor::Profiles,
+    voice_action: impl FnOnce() -> crate::dictation_processor::Processed,
+    processing: impl FnOnce(),
+) -> crate::dictation_processor::Processed {
+    if matches!(job.target, TranscriptionTarget::VoiceAction) {
+        processing();
+        voice_action()
+    } else {
+        let profiles = profiles();
+        if profiles.processes(&job.context) {
+            processing();
+        }
+        profiles.process_cancellable(&job.text, &job.context, &job.control.cancelled)
+    }
+}
+
 fn run_inference_worker(
     commands: Receiver<InferenceCommand>,
     processor_jobs: &SyncSender<ProcessorJob>,
@@ -611,14 +630,11 @@ fn run_inference_worker(
         let prepare_started = Instant::now();
         let clip_samples = job.clip.into_transcription_samples();
         crate::dictation_diagnostics::persist(&clip_samples);
-        let samples = transcriber.prepare_samples(clip_samples);
         let prepare_ms = prepare_started.elapsed().as_millis();
         let inference_started = Instant::now();
-        let result = match (transcriber, job.protocol.as_deref()) {
-            (Transcriber::Gguf(model), Some(protocol)) => {
-                model.transcribe_voice(&samples, protocol)
-            }
-            (transcriber, _) => transcriber.transcribe(&samples),
+        let result = match job.protocol.as_deref() {
+            Some(protocol) => transcriber.transcribe_voice(clip_samples, protocol),
+            None => transcriber.transcribe(clip_samples),
         }
         .map(|text| {
             let corrected = if matches!(job.target, TranscriptionTarget::Service) {
@@ -1094,6 +1110,9 @@ impl Parakeet {
         self.selection.as_ref().map(|selection| selection.model)
     }
 
+    /// Low-level GGUF entry point over prepared audio. `Transcriber` owns the
+    /// whole-clip padding; chunks and control-trimmed reruns below only apply
+    /// the minimum duration, never another model-specific trailing context.
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
         let Some(max_audio_samples) = self.max_audio_samples else {
             return self.transcribe_segments(samples).map(|result| result.text);
@@ -1165,6 +1184,93 @@ mod tests {
 
     use crate::dictation::resample_for_parakeet;
     use crate::meeting::MeetingSource;
+
+    fn processing_job(target: TranscriptionTarget) -> ProcessorJob {
+        ProcessorJob {
+            job_id: DictationJobId(0),
+            control: Arc::new(JobControl::default()),
+            target,
+            text: "raw instruction".into(),
+            context: ContextSnapshot::default(),
+            timings: JobTimings {
+                total_started: Instant::now(),
+                queue_ms: 0,
+                audio_ms: 1000,
+                prepare_ms: 0,
+                inference_ms: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn voice_action_processing_never_loads_modes_and_announces_stage_before_generation() {
+        use crate::dictation_processor::{Processed, ProcessingObservation};
+        use std::cell::Cell;
+
+        let stage_sent = Cell::new(false);
+        let processed = process_job_text(
+            &processing_job(TranscriptionTarget::VoiceAction),
+            || panic!("Voice Action must not read ordinary mode settings"),
+            || {
+                assert!(
+                    stage_sent.get(),
+                    "stage must precede Voice Action settings/generation"
+                );
+                Processed {
+                    text: String::new(),
+                    observation: Some(ProcessingObservation {
+                        profile: "Voice Action".into(),
+                        latency_ms: 0,
+                        fallback: Some("fixture generation failed".into()),
+                    }),
+                    transformations: Vec::new(),
+                }
+            },
+            || stage_sent.set(true),
+        );
+        assert!(stage_sent.get());
+        assert!(
+            processed.text.is_empty(),
+            "failed actions must not fall back to the instruction"
+        );
+        assert!(processed.transformations.is_empty());
+        assert_eq!(
+            processed.observation.unwrap().fallback.as_deref(),
+            Some("fixture generation failed")
+        );
+    }
+
+    #[test]
+    fn ordinary_processing_snapshots_modes_before_stage_and_keeps_transformations() {
+        use crate::dictation_processor::{Profile, Profiles};
+        use std::cell::Cell;
+
+        for target in [TranscriptionTarget::Paste, TranscriptionTarget::Send] {
+            for transformations in [vec![], vec!["fixture-transform".to_string()]] {
+                let loaded = Cell::new(false);
+                let stage_sent = Cell::new(false);
+                let processed = process_job_text(
+                    &processing_job(target),
+                    || {
+                        assert!(!stage_sent.get());
+                        loaded.set(true);
+                        Profiles::new(
+                            Profile::new("Global", "").transformations(transformations.clone()),
+                        )
+                    },
+                    || panic!("ordinary dictation must not read Voice Action settings"),
+                    || {
+                        assert!(loaded.get());
+                        stage_sent.set(true);
+                    },
+                );
+                assert!(loaded.get());
+                assert_eq!(stage_sent.get(), !transformations.is_empty());
+                assert_eq!(processed.text, "raw instruction");
+                assert_eq!(processed.transformations, transformations);
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires HEX_COHERE_MODEL and HEX_COHERE_FIXTURES synthetic audio"]

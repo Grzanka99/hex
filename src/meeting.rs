@@ -788,8 +788,7 @@ fn transcribe_track(
         }
         let chunk_start_ms = chunk_index as u64 * 30_000 + source_offset_ms;
         let chunk_duration_ms = chunk.len() as u64 * 1_000 / u64::from(SAMPLE_RATE);
-        let samples = model.prepare_samples(chunk.to_vec());
-        let result = model.transcribe_segments(&samples)?;
+        let result = model.transcribe_segments(chunk.to_vec())?;
         if !result.segments.is_empty() {
             transcript.extend(result.segments.into_iter().filter_map(|segment| {
                 let text = segment.text.trim().to_string();

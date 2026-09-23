@@ -12,6 +12,12 @@ were run for this rewrite.
 
 ## How To Get To It
 
+Settings shortcut capture persists the candidate before showing Saved. If the
+write fails, capture remains active with an error; retry or cancel it explicitly.
+`failed_shortcut_save_stays_in_capture_and_preserves_pending_edits` in
+[app_window.rs](../../src/app_window.rs) checks this with injected persistence
+failure, not a physical shortcut or installed-app disk failure.
+
 **Shortcut:** Option by default, after macOS permissions and the selected local
 model are ready. Commands and OpenCode are not required. Settings > Dictation
 shortcut accepts modifier-only, modifier-plus-key, standalone Fn/Globe, and
@@ -138,6 +144,13 @@ regression also passed a roughly 235-second repeated fixture, retaining all thre
 sections in each repetition. This is Metal inference evidence on an M2 Max, not
 physical capture/paste or Linux runtime proof. Chunk boundaries can still affect
 individual words; this is not a claim of perfect recognition or silence handling.
+
+The macOS `Transcriber` owns backend input padding for ordinary, voice-protocol,
+and segmented transcription. `short_unified_input_is_minimum_padded_before_trailing_context`
+in [transcription.rs](../../src/transcription.rs) checks minimum-duration padding
+followed by Unified English's additional trailing silence. This is a pure sample
+policy check, not native inference-quality proof. Padding is now included in
+`inference_ms`; `prepare_ms` covers clip conversion and diagnostic retention.
 
 ```ts
 Listening idle                            // dictate.model-memory

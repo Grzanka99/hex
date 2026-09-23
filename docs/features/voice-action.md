@@ -143,6 +143,11 @@ default); no explicit model selection delegates to OpenCode's default.
 Audio transcription stays local, but the prompt text goes to the configured
 OpenCode provider.
 
+`voice_action_processing_never_loads_modes_and_announces_stage_before_generation`
+in [parakeet.rs](../../src/parakeet.rs) checks that this route never acquires
+ordinary Modes profiles and announces Processing before invoking Voice Action.
+It uses an injected processor, not a provider or native capture pipeline.
+
 `generation_http_wait_observes_cancellation_and_deadline` and
 `cancelled_generation_process_is_killed_promptly` in the processor cover local
 HTTP/process fixtures, not a live provider or the full Voice Action pipeline.
