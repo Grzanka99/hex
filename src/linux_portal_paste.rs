@@ -33,6 +33,19 @@ const KEYBOARD_INTERFACES: &[&str] = &[
     "ei_pingpong",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PasteKeys {
+    control: u32,
+    shift: u32,
+    v: u32,
+}
+
+const DEFAULT_PASTE_KEYS: PasteKeys = PasteKeys {
+    control: KEY_CTRL,
+    shift: KEY_SHIFT,
+    v: KEY_V,
+};
+
 pub(crate) fn uses_portal() -> bool {
     uses_portal_for(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
 }
@@ -287,12 +300,11 @@ impl PortalKeyboard {
             .devices
             .get(device)
             .ok_or_else(|| eyre!("keyboard interface unavailable"))?;
-        let v = match self.keymaps.get(keyboard) {
-            Some((keymap, group)) => key_for_v(keymap, *group)
-                .ok_or_else(|| eyre!("desktop keyboard layout has no V key for paste"))?,
+        let keys = match self.keymaps.get(keyboard) {
+            Some((keymap, group)) => resolve_paste_keys(keymap, *group, shift)?,
             // The protocol permits omitting a keymap; in that case the server
-            // defines its keycodes and the beta's physical US V is the default.
-            None => KEY_V,
+            // defines its keycodes and the beta's physical US keys are the default.
+            None => DEFAULT_PASTE_KEYS,
         };
         let mut time = libc::timespec {
             tv_sec: 0,
@@ -304,7 +316,7 @@ impl PortalKeyboard {
         self.sequence = self.sequence.wrapping_add(1);
         device.start_emulating(self.last_serial, self.sequence);
         let timestamp = time.tv_sec as u64 * 1_000_000 + time.tv_nsec as u64 / 1_000;
-        for (index, (key, state)) in paste_sequence(shift, v).into_iter().enumerate() {
+        for (index, (key, state)) in paste_sequence(shift, keys).into_iter().enumerate() {
             keyboard.key(key, state);
             device.frame(self.last_serial, timestamp + index as u64);
         }
@@ -349,18 +361,18 @@ fn close_session(session: &Session<'_, RemoteDesktop<'_>>) {
     }));
 }
 
-fn paste_sequence(shift: bool, v: u32) -> Vec<(u32, ei::keyboard::KeyState)> {
+fn paste_sequence(shift: bool, keys: PasteKeys) -> Vec<(u32, ei::keyboard::KeyState)> {
     use ei::keyboard::KeyState::{Press, Released};
-    let mut keys = vec![(KEY_CTRL, Press)];
+    let mut sequence = vec![(keys.control, Press)];
     if shift {
-        keys.push((KEY_SHIFT, Press));
+        sequence.push((keys.shift, Press));
     }
-    keys.extend([(v, Press), (v, Released)]);
+    sequence.extend([(keys.v, Press), (keys.v, Released)]);
     if shift {
-        keys.push((KEY_SHIFT, Released));
+        sequence.push((keys.shift, Released));
     }
-    keys.push((KEY_CTRL, Released));
-    keys
+    sequence.push((keys.control, Released));
+    sequence
 }
 
 fn parse_keymap(fd: std::os::fd::OwnedFd, size: u32) -> Result<xkb::Keymap> {
@@ -399,14 +411,71 @@ fn parse_keymap_bytes(mut bytes: Vec<u8>) -> Result<xkb::Keymap> {
     .ok_or_else(|| eyre!("could not load desktop keyboard keymap"))
 }
 
-fn key_for_v(keymap: &xkb::Keymap, group: u32) -> Option<u32> {
+fn key_for_symbol(keymap: &xkb::Keymap, group: u32, symbol: xkb::Keysym) -> Option<u32> {
     (keymap.min_keycode().raw()..=keymap.max_keycode().raw()).find_map(|code| {
         keymap
             .key_get_syms_by_level(xkb::Keycode::new(code), group, 0)
-            .contains(&xkb::Keysym::new(u32::from(b'v')))
+            .contains(&symbol)
             .then_some(code.checked_sub(8))
             .flatten()
     })
+}
+
+fn key_for_modifier(
+    keymap: &xkb::Keymap,
+    group: u32,
+    symbols: &[xkb::Keysym],
+    name: &str,
+) -> Option<u32> {
+    (keymap.min_keycode().raw()..=keymap.max_keycode().raw()).find_map(|code| {
+        let key = xkb::Keycode::new(code);
+        if !keymap
+            .key_get_syms_by_level(key, group, 0)
+            .iter()
+            .any(|symbol| symbols.contains(symbol))
+        {
+            return None;
+        }
+        let mut state = xkb::State::new(keymap);
+        state.update_mask(0, 0, 0, 0, 0, group);
+        state.update_key(key, xkb::KeyDirection::Down);
+        state
+            .mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE)
+            .then_some(code.checked_sub(8))
+            .flatten()
+    })
+}
+
+fn resolve_paste_keys(keymap: &xkb::Keymap, group: u32, shift: bool) -> Result<PasteKeys> {
+    let control = key_for_modifier(
+        keymap,
+        group,
+        &[xkb::Keysym::Control_L, xkb::Keysym::Control_R],
+        xkb::MOD_NAME_CTRL,
+    )
+    .ok_or_else(|| eyre!("desktop keyboard layout has no Control key for paste"))?;
+    let shift = if shift {
+        key_for_modifier(
+            keymap,
+            group,
+            &[xkb::Keysym::Shift_L, xkb::Keysym::Shift_R],
+            xkb::MOD_NAME_SHIFT,
+        )
+        .ok_or_else(|| eyre!("desktop keyboard layout has no Shift key for paste"))?
+    } else {
+        KEY_SHIFT
+    };
+    let v = key_for_symbol(keymap, group, xkb::Keysym::v)
+        .or_else(|| {
+            // Non-Latin groups often have no Latin shortcut letter. Prefer the
+            // active group's position (e.g. Dvorak), then a Latin group in the
+            // same compositor keymap rather than blindly sending US evdev V.
+            (0..keymap.num_layouts())
+                .filter(|candidate| *candidate != group)
+                .find_map(|candidate| key_for_symbol(keymap, candidate, xkb::Keysym::v))
+        })
+        .ok_or_else(|| eyre!("desktop keyboard layout has no V key for paste"))?;
+    Ok(PasteKeys { control, shift, v })
 }
 
 fn token_path() -> Result<PathBuf> {
@@ -477,7 +546,7 @@ mod tests {
     #[test]
     fn terminal_and_standard_shortcuts_release_every_key() {
         for shift in [true, false] {
-            let sequence = paste_sequence(shift, KEY_V);
+            let sequence = paste_sequence(shift, DEFAULT_PASTE_KEYS);
             let pressed: Vec<_> = sequence
                 .iter()
                 .filter(|(_, state)| *state == ei::keyboard::KeyState::Press)
@@ -515,8 +584,8 @@ mod tests {
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
         .unwrap();
-        assert_eq!(key_for_v(&us, 0), Some(KEY_V));
-        assert_ne!(key_for_v(&dvorak, 0), Some(KEY_V));
+        assert_eq!(resolve_paste_keys(&us, 0, false).unwrap().v, KEY_V);
+        assert_ne!(resolve_paste_keys(&dvorak, 0, false).unwrap().v, KEY_V);
     }
 
     #[test]
@@ -536,14 +605,18 @@ mod tests {
             .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
             .into_bytes();
         assert_eq!(
-            key_for_v(&parse_keymap_bytes(bytes.clone()).unwrap(), 0),
-            Some(KEY_V)
+            resolve_paste_keys(&parse_keymap_bytes(bytes.clone()).unwrap(), 0, false)
+                .unwrap()
+                .v,
+            KEY_V
         );
         let mut terminated = bytes.clone();
         terminated.push(0);
         assert_eq!(
-            key_for_v(&parse_keymap_bytes(terminated).unwrap(), 0),
-            Some(KEY_V)
+            resolve_paste_keys(&parse_keymap_bytes(terminated).unwrap(), 0, false)
+                .unwrap()
+                .v,
+            KEY_V
         );
         let mut malformed = bytes;
         malformed.push(0);
@@ -575,8 +648,67 @@ mod tests {
         file.write_all(&bytes).unwrap();
         file.seek(SeekFrom::End(0)).unwrap();
         assert_eq!(
-            key_for_v(&parse_keymap(file.into(), bytes.len() as u32).unwrap(), 0),
-            Some(KEY_V)
+            resolve_paste_keys(
+                &parse_keymap(file.into(), bytes.len() as u32).unwrap(),
+                0,
+                false
+            )
+            .unwrap()
+            .v,
+            KEY_V
         );
+    }
+
+    #[test]
+    fn swapped_caps_and_control_uses_the_real_control_modifier() {
+        let keymap = xkb::Keymap::new_from_names(
+            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            "evdev",
+            "pc105",
+            "us",
+            "",
+            Some("ctrl:swapcaps".into()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let keys = resolve_paste_keys(&keymap, 0, true).unwrap();
+        assert_eq!(keys.control, 58); // evdev Caps Lock now produces Control.
+        assert_eq!(keys.shift, KEY_SHIFT);
+        assert_eq!(keys.v, KEY_V);
+        assert_eq!(paste_sequence(false, keys)[0].0, keys.control);
+    }
+
+    #[test]
+    fn non_latin_group_uses_latin_shortcut_position_without_losing_dvorak() {
+        let keymap = xkb::Keymap::new_from_names(
+            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            "evdev",
+            "pc105",
+            "us,ru",
+            "dvorak,",
+            Some(String::new()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        assert_eq!(keymap.num_layouts(), 2);
+        assert!(key_for_symbol(&keymap, 1, xkb::Keysym::v).is_none());
+        let latin = resolve_paste_keys(&keymap, 0, false).unwrap();
+        let russian = resolve_paste_keys(&keymap, 1, false).unwrap();
+        assert_ne!(latin.v, KEY_V);
+        assert_eq!(russian.v, latin.v);
+        assert_eq!(russian.control, latin.control);
+        assert!(resolve_paste_keys(&keymap, 1, true).is_ok());
+
+        let russian_only = xkb::Keymap::new_from_names(
+            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            "evdev",
+            "pc105",
+            "ru",
+            "",
+            Some(String::new()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        assert!(resolve_paste_keys(&russian_only, 0, false).is_err());
     }
 }

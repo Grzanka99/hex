@@ -469,10 +469,13 @@ No Linux Commands, Voice Action, Modes processing, retained History, or meetings
 input-device access; physical reconnect and click-through still need native
 evidence. KDE and GNOME insertion request portal keyboard control on first
 paste, retain a private restore token when granted, and fail explicitly when
-authorization is denied or the keyboard device disappears. KDE Plasma Wayland
-paste was confirmed by the user on an installed source build; GNOME, portal
-revocation recovery, and other target applications remain unverified. GNOME
-lacks the layer-shell HUD, and its hotkey interactions remain unvalidated.
+authorization is denied or the keyboard device disappears. Paste resolves
+Control, Shift, and V from the compositor keymap; a non-Latin active group
+uses a Latin group for V, while an unresolved modifier fails before injection.
+KDE Plasma Wayland paste was confirmed by the user on an installed source
+build; GNOME, portal revocation recovery, and other target applications remain
+unverified. GNOME lacks the layer-shell HUD, and its hotkey interactions remain
+unvalidated.
 The [Sway smoke](../../scripts/test-wayland-paste.sh) isolates
 `HEX_APPLICATION_SUPPORT_DIR` and checks that Settings can exit without stopping
 the service.
