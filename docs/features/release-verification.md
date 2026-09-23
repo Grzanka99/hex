@@ -205,6 +205,36 @@ screenshots were captured; the signed candidate launched its Settings preview
 window. No installed app or cask was replaced, no physical dictation was
 performed, and no Linux binary was published.
 
+## macOS 2.1.22
+
+**Published September 22, 2026:** [2.1.22](../releases/2.1.22.md), release commit
+`5679730`, build `20122`. The cleanup passed 483 debug and 482 release Rust tests,
+with twelve opt-in tests ignored and all twelve keyboard-layout child scenarios
+passing in each profile. Strict all-target/all-feature Clippy and formatting
+passed. The public SDK passed typecheck, 70 tests, and build. Linux CI passed on
+the cleanup commit `7b0c6f6`; no Linux binary was published. The version bump
+passed Cargo check and app identity guards with the configured CMake executable.
+
+Apple accepted the app and DMG; stapling and Gatekeeper validation passed.
+The publisher verified identical app payloads in the DMG and Sparkle ZIP, then
+verified downloaded artifact bytes before advancing the latest pointer and feed.
+The DMG SHA-256 is
+`9cd036ca910919f1793e32452c671cc204c8ce97d6542e031c89b992a0f952b0`;
+the ZIP SHA-256 is
+`7f35a557073d037ff54573f51222c934689bacb283559c6618a5d9e6aed2d7ea`.
+The live feed leads with build `20122`, and both the custom-host and GitHub DMG
+links return HTTP 200.
+
+The `.dev` site passed build and Cloudflare deployment. The `.com` site passed
+lint, typecheck, build, and Vercel deployment. Production responses from both
+custom domains and both Vercel aliases contain 2.1.22 and both download
+destinations. These are HTTP/content checks, not browser interaction evidence.
+[Homebrew cask PR #21](https://github.com/anomalyco/homebrew-tap/pull/21) merged
+after Ruby syntax, style, strict online audit, checksum fetch, and livecheck
+(`2.1.22 ==> 2.1.22`) passed using a temporary verification tap, since removed.
+No installed app was replaced, physical dictation performed, or native GUI
+verification added for this release.
+
 ## Linux Service Build
 
 **Observed September 4, 2026, local service build:** 139 Rust tests passed (seven
