@@ -21,7 +21,6 @@ use crate::app_settings::{
 use crate::application_catalog::InstalledApplication;
 use crate::commands::{CommandConfig, CommandInfo, CommandScope};
 use crate::desktop_activity::DesktopActivity;
-use crate::desktop_host::DesktopCapabilities;
 use crate::desktop_transcription_picker::{
     TranscriptionPickerDelegate, TranscriptionPickerModel, TranscriptionPickerProgress,
     TranscriptionPickerStatus, TranscriptionPickerView,
@@ -483,18 +482,16 @@ impl Pane {
         Self::Activity,
     ];
 
-    fn all(capabilities: DesktopCapabilities) -> Vec<Self> {
+    fn all(developer_features: bool) -> Vec<Self> {
         Self::ALL
             .into_iter()
             .filter(|pane| match pane {
-                Self::Settings => true,
-                Self::Modes => capabilities.modes,
-                Self::Commands => capabilities.commands,
-                Self::VoiceAction => capabilities.voice_action,
-                Self::History => capabilities.history,
-                Self::HudLab => capabilities.hud_lab,
-                Self::Meetings => capabilities.meetings,
-                Self::Activity => capabilities.activity,
+                Self::Settings
+                | Self::Modes
+                | Self::Commands
+                | Self::VoiceAction
+                | Self::History => true,
+                Self::HudLab | Self::Meetings | Self::Activity => developer_features,
             })
             .collect()
     }
@@ -2509,20 +2506,18 @@ impl AppWindow {
     }
 
     fn render_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let items = Pane::all(DesktopCapabilities::macos(
-            crate::DEVELOPER_FEATURES_ENABLED,
-        ))
-        .into_iter()
-        .enumerate()
-        .map(|(index, pane)| {
-            let selected = self.pane == pane;
-            navigation_item(pane.icon(), selected)
-                .id(("app-nav", index))
-                .child(pane.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_pane(pane, cx);
-                }))
-        });
+        let items = Pane::all(crate::DEVELOPER_FEATURES_ENABLED)
+            .into_iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                let selected = self.pane == pane;
+                navigation_item(pane.icon(), selected)
+                    .id(("app-nav", index))
+                    .child(pane.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_pane(pane, cx);
+                    }))
+            });
 
         sidebar_frame()
             .w(px(SIDEBAR_WIDTH))
@@ -9208,13 +9203,30 @@ mod tests {
     #[test]
     fn production_navigation_keeps_commands_available_as_an_opt_in() {
         assert_eq!(
-            Pane::all(DesktopCapabilities::macos(false)),
+            Pane::all(false),
             vec![
                 Pane::Settings,
                 Pane::Modes,
                 Pane::Commands,
                 Pane::VoiceAction,
                 Pane::History,
+            ]
+        );
+    }
+
+    #[test]
+    fn developer_navigation_appends_developer_panes_in_order() {
+        assert_eq!(
+            Pane::all(true),
+            vec![
+                Pane::Settings,
+                Pane::Modes,
+                Pane::Commands,
+                Pane::VoiceAction,
+                Pane::History,
+                Pane::HudLab,
+                Pane::Meetings,
+                Pane::Activity,
             ]
         );
     }

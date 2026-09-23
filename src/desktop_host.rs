@@ -1,62 +1,10 @@
-#[cfg(target_os = "linux")]
 use color_eyre::Result;
 
-#[cfg(target_os = "linux")]
 use crate::desktop_activity::DesktopActivity;
-#[cfg(target_os = "linux")]
 use crate::transcription_models::{
     ModelPreparationStage, TranscriptionModelId, TranscriptionSelection,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DesktopCapabilities {
-    pub(crate) activity: bool,
-    pub(crate) commands: bool,
-    pub(crate) history: bool,
-    pub(crate) hud_lab: bool,
-    pub(crate) meetings: bool,
-    pub(crate) modes: bool,
-    pub(crate) replacements: bool,
-    pub(crate) listener_control: bool,
-    pub(crate) update_restart: bool,
-    pub(crate) voice_action: bool,
-}
-
-impl DesktopCapabilities {
-    #[cfg(target_os = "macos")]
-    pub(crate) const fn macos(developer_features: bool) -> Self {
-        Self {
-            activity: developer_features,
-            commands: true,
-            history: true,
-            hud_lab: developer_features,
-            meetings: developer_features,
-            modes: true,
-            replacements: true,
-            listener_control: false,
-            update_restart: false,
-            voice_action: true,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) const fn linux_x11() -> Self {
-        Self {
-            activity: false,
-            commands: false,
-            history: false,
-            hud_lab: false,
-            meetings: false,
-            modes: false,
-            replacements: false,
-            listener_control: true,
-            update_restart: true,
-            voice_action: false,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopSnapshot {
     pub(crate) activity: DesktopActivity,
@@ -69,7 +17,6 @@ pub(crate) struct DesktopSnapshot {
     pub(crate) update_status: DesktopUpdateStatus,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopTranscriptionSnapshot {
     pub(crate) downloaded_bytes: u64,
@@ -79,14 +26,12 @@ pub(crate) struct DesktopTranscriptionSnapshot {
     pub(crate) preparing: Option<TranscriptionModelId>,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopListenerSnapshot {
     pub(crate) running: bool,
     pub(crate) status: String,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DesktopUpdateStatus {
     Unavailable,
@@ -96,7 +41,6 @@ pub(crate) enum DesktopUpdateStatus {
     ReadyToRestart,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DesktopShortcut {
     pub(crate) alt: bool,
@@ -107,7 +51,6 @@ pub(crate) struct DesktopShortcut {
     pub(crate) shift: bool,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DesktopAction {
     ClearError,
@@ -120,14 +63,12 @@ pub(crate) enum DesktopAction {
 }
 
 /// Contract between the Linux Settings client and its service-owned runtime.
-#[cfg(target_os = "linux")]
 pub(crate) trait DesktopHost {
-    fn capabilities(&self) -> DesktopCapabilities;
     fn snapshot(&self) -> DesktopSnapshot;
     fn dispatch(&mut self, action: DesktopAction) -> Result<()>;
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -136,10 +77,6 @@ mod tests {
     struct TestHost;
 
     impl DesktopHost for TestHost {
-        fn capabilities(&self) -> DesktopCapabilities {
-            DesktopCapabilities::linux_x11()
-        }
-
         fn snapshot(&self) -> DesktopSnapshot {
             DesktopSnapshot {
                 activity: DesktopActivity::default(),
@@ -167,24 +104,5 @@ mod tests {
     #[test]
     fn host_can_be_contained_by_the_shared_window() {
         owns_host_object(Box::new(TestHost));
-    }
-
-    #[test]
-    fn linux_exposes_only_implemented_product_capabilities() {
-        assert_eq!(
-            DesktopCapabilities::linux_x11(),
-            DesktopCapabilities {
-                activity: false,
-                commands: false,
-                history: false,
-                hud_lab: false,
-                meetings: false,
-                modes: false,
-                replacements: false,
-                listener_control: true,
-                update_restart: true,
-                voice_action: false,
-            }
-        );
     }
 }

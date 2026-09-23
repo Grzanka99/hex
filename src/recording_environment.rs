@@ -339,7 +339,11 @@ fn volume_address() -> AudioObjectPropertyAddress {
 }
 
 fn pause_media() -> Vec<MediaPlayer> {
-    let script = pause_media_script(&running_media_players());
+    let running = running_media_players();
+    if running.is_empty() {
+        return Vec::new();
+    }
+    let script = pause_media_script(&running);
     let output = Command::new("/usr/bin/osascript")
         .args(["-e", &script])
         .output();

@@ -24,8 +24,8 @@ mod context;
 mod dashboard;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod desktop_activity;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod desktop_host;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod desktop_transcription_picker;

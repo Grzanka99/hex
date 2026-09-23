@@ -137,9 +137,9 @@ substitute for source inspection or a second roadmap.
   projections.
 - `desktop_activity`: the shared listener, device, session, and latest-failure
   projection over `EventReader`. Transcript rows read retained events directly.
-- `desktop_host`: shared desktop capabilities and the Linux client/runtime's
-  portable snapshots and typed actions. The macOS root uses shared presentation
-  primitives and commits its own settings directly.
+- `desktop_host`: the Linux Settings/service snapshot-and-action contract.
+  macOS chooses its navigation directly from the developer-feature flag and
+  uses the shared presentation primitives while committing its own settings.
 - `desktop_ui`: platform-neutral GPUI visual tokens and controls shared by both
   desktop roots, including the mandatory pane scaffold: `pane_header` /
   `pane_header_with_action`, `pane_body`, `pane_content`, the shared

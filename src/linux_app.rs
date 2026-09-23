@@ -13,8 +13,8 @@ use gpui::{
 
 use crate::desktop_activity::DesktopActivity;
 use crate::desktop_host::{
-    DesktopAction, DesktopCapabilities, DesktopHost, DesktopListenerSnapshot, DesktopShortcut,
-    DesktopSnapshot, DesktopTranscriptionSnapshot, DesktopUpdateStatus,
+    DesktopAction, DesktopHost, DesktopListenerSnapshot, DesktopShortcut, DesktopSnapshot,
+    DesktopTranscriptionSnapshot, DesktopUpdateStatus,
 };
 use crate::desktop_transcription_picker::{
     TranscriptionPickerDelegate, TranscriptionPickerModel, TranscriptionPickerProgress,
@@ -236,10 +236,6 @@ impl RemoteHost {
 }
 
 impl DesktopHost for RemoteHost {
-    fn capabilities(&self) -> DesktopCapabilities {
-        DesktopCapabilities::linux_x11()
-    }
-
     fn snapshot(&self) -> DesktopSnapshot {
         let mut snapshot = self
             .client
@@ -1013,10 +1009,6 @@ impl Drop for LinuxDesktopHost {
 }
 
 impl DesktopHost for LinuxDesktopHost {
-    fn capabilities(&self) -> DesktopCapabilities {
-        DesktopCapabilities::linux_x11()
-    }
-
     fn snapshot(&self) -> DesktopSnapshot {
         let update_status = match &self.update {
             UpdateState::Unmanaged => DesktopUpdateStatus::Unavailable,

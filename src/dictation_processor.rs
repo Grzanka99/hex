@@ -334,9 +334,14 @@ pub fn load_model_catalog() -> Result<ModelCatalog> {
 }
 
 fn build_model_catalog(models: Vec<ModelInfo>, default: Option<ModelInfo>) -> ModelCatalog {
+    let default_key = default
+        .as_ref()
+        .map(|model| format!("{}/{}", model.provider_id, model.id));
+    let default_name = default.as_ref().map(|model| model.name.clone());
     let mut seen = HashSet::new();
-    let mut choices: Vec<ModelChoice> = models
+    let choices = models
         .into_iter()
+        .chain(default)
         .filter(model_is_available)
         .filter_map(|model| {
             let key = format!("{}/{}", model.provider_id, model.id);
@@ -352,26 +357,9 @@ fn build_model_catalog(models: Vec<ModelInfo>, default: Option<ModelInfo>) -> Mo
             })
         })
         .collect();
-    if let Some(model) = default.as_ref().filter(|model| model_is_available(model)) {
-        let key = format!("{}/{}", model.provider_id, model.id);
-        if seen.insert(key.clone()) {
-            choices.push(ModelChoice {
-                key,
-                name: model.name.clone(),
-                provider: model.provider_id.clone(),
-                variants: model
-                    .variants
-                    .iter()
-                    .map(|variant| variant.id.clone())
-                    .collect(),
-            });
-        }
-    }
     ModelCatalog {
-        default_key: default
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id, model.id)),
-        default_name: default.map(|model| model.name),
+        default_key,
+        default_name,
         models: choices,
     }
 }
@@ -1360,11 +1348,18 @@ mod tests {
         });
         let models: ModelsResponse =
             serde_json::from_value(serde_json::json!({ "data": wire_models })).unwrap();
-        let default: DefaultModelResponse =
+        let mut default: DefaultModelResponse =
             serde_json::from_value(serde_json::json!({ "data": wire_models[1] })).unwrap();
+        let default_model = default.data.as_mut().unwrap();
+        default_model.name = "Default display name".into();
+        default_model.variants.clear();
         let catalog = build_model_catalog(models.data, default.data);
 
         assert_eq!(catalog.models.len(), 2);
+        assert_eq!(
+            catalog.default_name.as_deref(),
+            Some("Default display name")
+        );
         assert_eq!(
             catalog.default_key.as_deref(),
             Some("example/rewrite-careful")
@@ -1375,6 +1370,7 @@ mod tests {
             .zip(["rewrite-fast", "rewrite-careful"])
         {
             assert_eq!(choice.key, format!("example/{expected_id}"));
+            assert_eq!(choice.name, expected_id);
             assert_eq!(choice.variants, ["high"]);
             let (provider, id) = choice.key.split_once('/').unwrap();
             let model = Model {
@@ -1418,7 +1414,8 @@ mod tests {
             }
         }))
         .unwrap();
-        let catalog = build_model_catalog(Vec::new(), default.data);
+        let model = default.data.unwrap();
+        let catalog = build_model_catalog(Vec::new(), Some(model.clone()));
 
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].key, "example/rewrite-default");
@@ -1428,6 +1425,27 @@ mod tests {
             Some("example/rewrite-default")
         );
         assert_eq!(catalog.default_name.as_deref(), Some("Example Rewrite"));
+
+        for unavailable in [
+            ModelInfo {
+                enabled: false,
+                ..model.clone()
+            },
+            ModelInfo {
+                capabilities: ModelCapabilities {
+                    output: vec!["image".into()],
+                },
+                ..model
+            },
+        ] {
+            let catalog = build_model_catalog(Vec::new(), Some(unavailable));
+            assert!(catalog.models.is_empty());
+            assert_eq!(
+                catalog.default_key.as_deref(),
+                Some("example/rewrite-default")
+            );
+            assert_eq!(catalog.default_name.as_deref(), Some("Example Rewrite"));
+        }
     }
 
     #[test]
