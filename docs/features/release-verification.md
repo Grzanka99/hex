@@ -172,6 +172,39 @@ The Homebrew cask passed Ruby syntax, style, strict online audit, checksum fetch
 and livecheck (`2.1.20 ==> 2.1.20`). No installed app or cask was replaced, no
 physical dictation was performed, and no Linux binary was published.
 
+**Published September 22, 2026:** [2.1.21](../releases/2.1.21.md), release commit
+`04a42da`, build `20121`. The debug suite passed 481 Rust tests plus all twelve
+keyboard-layout child scenarios with twelve opt-in tests skipped; the earlier
+audited tree at `b774568` also passed the optimized suite (475 tests), strict
+Clippy in both profiles, the live OpenCode catalog check, and the native feedback
+output-assertion smoke. Strict debug Clippy, formatting, the public and command
+SDK typechecks, tests, and builds, and the app identity guards passed on the
+release commit. An independent read-only review of the capture-path refactor
+found no blocking issues. Linux CI passed its Ubuntu job on `b774568`; the Nix
+job was still running at publication. No optimized-profile test run was repeated
+on `04a42da` itself.
+
+Apple accepted the app and DMG for notarization; both were stapled, and
+Gatekeeper accepted the DMG. The publisher's payload comparison passed. The
+versioned custom-domain DMG, latest-DMG pointer, and GitHub mirror match the
+prepared SHA-256
+`0cae65210edffce60a2ab1d51c13eebe91d490c7292fbc711c49abb4df70169e`.
+The published Sparkle ZIP matches the prepared SHA-256
+`847cf80836aefd6ab4b028ba476c8dafad0780b3753b00eb98aaf04b1536b0e4`,
+and the feed leads with build `20121`. A first candidate built from `7b95cc2`
+was notarized and then superseded by this build before publication; it was never
+uploaded.
+
+Both production marketing sites show the versioned 2.1.21 primary and GitHub
+downloads. The `.dev` site build and Cloudflare deploy passed; the `.com` site's
+lint, typecheck, build, and Vercel deployment passed.
+[Homebrew cask PR #20](https://github.com/anomalyco/homebrew-tap/pull/20) passed
+Ruby syntax, style, strict online audit, checksum fetch, and livecheck
+(`2.1.21 ==> 2.1.21`). Screen Recording remained unavailable, so no window
+screenshots were captured; the signed candidate launched its Settings preview
+window. No installed app or cask was replaced, no physical dictation was
+performed, and no Linux binary was published.
+
 ## Linux Service Build
 
 **Observed September 4, 2026, local service build:** 139 Rust tests passed (seven

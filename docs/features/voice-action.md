@@ -35,7 +35,7 @@ is excluded from errors. `service_discovery_supports_current_and_legacy_endpoint
 and `service_discovery_fallback_shares_deadline_and_observes_cancellation` cover
 these routes with executable fixtures. This shared discovery also serves Modes.
 
-**Fixed after 2.1.20:** releases 2.1.18 through 2.1.20 only tried
+**Fixed in 2.1.21:** releases 2.1.18 through 2.1.20 only tried
 `/api/status` and `/api/health`, and posted generation to `/api/generate`.
 OpenCode `0.0.0-dev-19726` and later serve only `/api/info` and
 `/api/experimental/generate`, so those releases report `OpenCode service

@@ -257,7 +257,7 @@ samples remain decoded in memory. A tone that arrives after the grace pays a
 cold device open first; the tone is delayed, not clipped or dropped.
 Overlapping tones extend the playing window rather than shortening it.
 
-**Fixed after 2.1.20:** through 2.1.20 the worker opened the output at startup
+**Fixed in 2.1.21:** through 2.1.20 the worker opened the output at startup
 and kept it open for as long as sounds were On, so `coreaudiod` held a
 `PreventUserIdleSystemSleep` assertion for HEX's PID and an idle Mac never
 slept ([#95](https://github.com/anomalyco/hex/issues/95)). 2.1.18 released the
